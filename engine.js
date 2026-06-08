@@ -6,6 +6,7 @@ import { v4 as uuidv4 } from 'uuid';
 import crypto from 'crypto';
 import fs from 'fs/promises';
 import path from 'path';
+import { Readable } from 'stream';
 import Redis from 'ioredis';
 import NodeClam from 'clamscan';
 
@@ -164,7 +165,8 @@ app.post('/upload', verifyApiKey, upload.single('image'), async (req, res) => {
     if (!metadata.format) throw new Error('Invalid image format');
 
     if (clamscan) {
-      const { isInfected, viruses } = await clamscan.scanBuffer(buf, 30000);
+      const stream = Readable.from(buf);
+      const { isInfected, viruses } = await clamscan.scanStream(stream);
       if (isInfected) throw new Error(`Malware detected: ${viruses.join(', ')}`);
     }
 
