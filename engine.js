@@ -19,7 +19,7 @@ const WEBP_QUALITY = parseInt(process.env.WEBP_QUALITY, 10) || 92;
 const CONCURRENCY_LIMIT = parseInt(process.env.CONCURRENCY_LIMIT, 10) || 2;
 const STORAGE_PATH = process.env.STORAGE_PATH || '/var/www/al-nikaah-people-images';
 const REDIS_URL = process.env.REDIS_URL || 'redis://127.0.0.1:6379';
-const PUBLIC_URL = process.env.PUBLIC_URL || 'http://localhost:3001';   // new
+const PUBLIC_URL = process.env.PUBLIC_URL || 'http://localhost:3001';
 
 await fs.mkdir(STORAGE_PATH, { recursive: true });
 
@@ -35,15 +35,21 @@ try {
   clamscan = null;
 }
 
-// ------------------- Redis & distributed semaphore -------------------
+// ------------------- Redis -------------------
+// Separate connections: one for commands, one dedicated to pub/sub subscribing
 const redis = new Redis(REDIS_URL, { maxRetriesPerRequest: null });
-redis.on('error', (err) => { console.error('Redis error:', err); process.exit(1); });
+const redisSub = new Redis(REDIS_URL, { maxRetriesPerRequest: null });
 
+redis.on('error', (err) => { console.error('Redis error:', err); process.exit(1); });
+redisSub.on('error', (err) => { console.error('RedisSub error:', err); process.exit(1); });
+
+// ------------------- Distributed semaphore -------------------
 const NOTIFY_CHANNEL = 'semaphore:notify';
 const ACTIVE_KEY = 'semaphore:active';
 const WAIT_KEY = 'semaphore:wait';
 
-const acquireSemaphore = redis.defineCommand('acquireSemaphore', {
+// defineCommand registers the Lua script as redis.acquireSemaphore / redis.releaseSemaphore
+redis.defineCommand('acquireSemaphore', {
   numberOfKeys: 2,
   lua: `
     local active_key = KEYS[1]
@@ -58,10 +64,10 @@ const acquireSemaphore = redis.defineCommand('acquireSemaphore', {
       redis.call('RPUSH', wait_key, client_id)
       return 'QUEUED'
     end
-  `
+  `,
 });
 
-const releaseSemaphore = redis.defineCommand('releaseSemaphore', {
+redis.defineCommand('releaseSemaphore', {
   numberOfKeys: 2,
   lua: `
     local active_key = KEYS[1]
@@ -72,33 +78,37 @@ const releaseSemaphore = redis.defineCommand('releaseSemaphore', {
     if next_client then
       redis.call('PUBLISH', notify_channel, next_client)
     end
-  `
+  `,
 });
 
 async function acquireSlot() {
   const clientId = uuidv4();
-  const result = await acquireSemaphore(ACTIVE_KEY, WAIT_KEY, CONCURRENCY_LIMIT, clientId);
+  // Call the registered Lua command via the main redis connection
+  const result = await redis.acquireSemaphore(ACTIVE_KEY, WAIT_KEY, CONCURRENCY_LIMIT, clientId);
   if (result === 'ACQUIRED') return;
+
+  // Wait for a publish notification on the dedicated subscriber connection
   return new Promise((resolve) => {
-    const listener = (channel, message) => {
+    const onMessage = (channel, message) => {
       if (channel === NOTIFY_CHANNEL && message === clientId) {
-        redis.removeListener('message', listener);
-        redis.unsubscribe(NOTIFY_CHANNEL);
+        redisSub.removeListener('message', onMessage);
+        redisSub.unsubscribe(NOTIFY_CHANNEL);
         resolve();
       }
     };
-    redis.on('message', listener);
-    redis.subscribe(NOTIFY_CHANNEL);
+    redisSub.on('message', onMessage);
+    redisSub.subscribe(NOTIFY_CHANNEL);
+
     setTimeout(() => {
-      redis.removeListener('message', listener);
-      redis.unsubscribe(NOTIFY_CHANNEL);
+      redisSub.removeListener('message', onMessage);
+      redisSub.unsubscribe(NOTIFY_CHANNEL);
       resolve();
     }, 30000);
   });
 }
 
 async function releaseSlot() {
-  await releaseSemaphore(ACTIVE_KEY, WAIT_KEY, NOTIFY_CHANNEL);
+  await redis.releaseSemaphore(ACTIVE_KEY, WAIT_KEY, NOTIFY_CHANNEL);
 }
 
 // ------------------- Encryption -------------------
@@ -146,30 +156,34 @@ app.get('/health', (req, res) => res.send('OK'));
 
 app.post('/upload', verifyApiKey, upload.single('image'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No image file' });
+
   await acquireSlot();
   try {
     const buf = req.file.buffer;
     const metadata = await sharp(buf).metadata();
     if (!metadata.format) throw new Error('Invalid image format');
+
     if (clamscan) {
       const { isInfected, viruses } = await clamscan.scanBuffer(buf, 30000);
       if (isInfected) throw new Error(`Malware detected: ${viruses.join(', ')}`);
     }
+
     const webpBuffer = await sharp(buf)
       .withMetadata(false)
       .webp({ quality: WEBP_QUALITY })
       .toBuffer();
+
     const encrypted = encryptBuffer(webpBuffer);
     const fileId = uuidv4();
     await fs.writeFile(path.join(STORAGE_PATH, fileId), encrypted, { mode: 0o600 });
+
     console.log(`Processed ${fileId} (${(webpBuffer.length / 1024).toFixed(1)} KB)`);
-    // Return full URL
     res.json({ url: `${PUBLIC_URL}/img/${fileId}` });
   } catch (err) {
     console.error('Upload error:', err.message);
     res.status(400).json({ error: err.message });
   } finally {
-    releaseSlot();
+    await releaseSlot(); // must be awaited so slot is always freed
   }
 });
 
