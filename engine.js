@@ -9,6 +9,7 @@ import path from 'path';
 import { Readable } from 'stream';
 import Redis from 'ioredis';
 import NodeClam from 'clamscan';
+import { fileURLToPath } from 'url';
 
 // ------------------- Configuration -------------------
 const PORT = process.env.PORT || 3001;
@@ -22,6 +23,35 @@ const STORAGE_PATH = process.env.STORAGE_PATH || '/var/www/al-nikaah-people-imag
 const REDIS_URL = process.env.REDIS_URL || 'redis://127.0.0.1:6379';
 const PUBLIC_URL = process.env.PUBLIC_URL || 'http://localhost:3001';
 
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// ------------------- Log Capture -------------------
+// Must be set up before anything else logs so the UI shows startup messages.
+const LOG_BUFFER_SIZE = 500;
+const logBuffer = [];
+const sseClients = new Set();
+
+function emitLog(level, ...args) {
+  const message = args
+    .map((a) => (a instanceof Error ? a.stack || a.message : typeof a === 'object' ? JSON.stringify(a) : String(a)))
+    .join(' ');
+  const entry = { time: new Date().toISOString(), level, message };
+  logBuffer.push(entry);
+  if (logBuffer.length > LOG_BUFFER_SIZE) logBuffer.shift();
+  const payload = `data: ${JSON.stringify(entry)}\n\n`;
+  for (const client of sseClients) client.write(payload);
+}
+
+const _log = console.log.bind(console);
+const _warn = console.warn.bind(console);
+const _error = console.error.bind(console);
+
+console.log = (...a) => { _log(...a); emitLog('info', ...a); };
+console.warn = (...a) => { _warn(...a); emitLog('warn', ...a); };
+console.error = (...a) => { _error(...a); emitLog('error', ...a); };
+
+// ------------------- Storage -------------------
 await fs.mkdir(STORAGE_PATH, { recursive: true });
 
 // ------------------- ClamAV -------------------
@@ -153,8 +183,117 @@ const verifyApiKey = (req, res, next) => {
   next();
 };
 
+// ------------------- Health -------------------
 app.get('/health', (req, res) => res.send('OK'));
 
+// ------------------- UI Routes -------------------
+// Serve the dashboard HTML
+app.get('/ui', async (req, res) => {
+  try {
+    const html = await fs.readFile(path.join(__dirname, 'ui.html'));
+    res.set('Content-Type', 'text/html; charset=utf-8');
+    res.send(html);
+  } catch (err) {
+    res.status(500).send('UI not found: ' + err.message);
+  }
+});
+
+// Stats endpoint — engine health, config, storage summary
+app.get('/ui/api/stats', async (req, res) => {
+  let redisStatus = 'disconnected';
+  let activeSlots = 0;
+  try {
+    await redis.ping();
+    redisStatus = 'connected';
+    const raw = await redis.get(ACTIVE_KEY);
+    activeSlots = Math.max(0, parseInt(raw || '0', 10));
+  } catch (_) {}
+
+  let imageCount = 0;
+  let storageBytes = 0;
+  try {
+    const files = await fs.readdir(STORAGE_PATH);
+    const imageFiles = files.filter((f) => UUID_RE.test(f));
+    imageCount = imageFiles.length;
+    const sizes = await Promise.all(
+      imageFiles.map((f) =>
+        fs.stat(path.join(STORAGE_PATH, f))
+          .then((s) => s.size)
+          .catch(() => 0)
+      )
+    );
+    storageBytes = sizes.reduce((a, b) => a + b, 0);
+  } catch (_) {}
+
+  res.json({
+    uptime: process.uptime(),
+    memoryRss: process.memoryUsage().rss,
+    imageCount,
+    storageBytes,
+    activeSlots,
+    redisStatus,
+    clamavStatus: clamscan ? 'connected' : 'unavailable',
+    config: {
+      port: PORT,
+      maxFileSize: MAX_FILE_SIZE,
+      webpQuality: WEBP_QUALITY,
+      concurrencyLimit: CONCURRENCY_LIMIT,
+      storagePath: STORAGE_PATH,
+      publicUrl: PUBLIC_URL,
+    },
+  });
+});
+
+// Images listing endpoint — returns metadata for all stored images
+app.get('/ui/api/images', async (req, res) => {
+  try {
+    const files = await fs.readdir(STORAGE_PATH);
+    const imageFiles = files.filter((f) => UUID_RE.test(f));
+    const images = await Promise.all(
+      imageFiles.map(async (f) => {
+        const stat = await fs.stat(path.join(STORAGE_PATH, f));
+        return {
+          id: f,
+          url: `${PUBLIC_URL}/img/${f}`,
+          size: stat.size,
+          created: stat.birthtime || stat.mtime,
+        };
+      })
+    );
+    // Newest first
+    images.sort((a, b) => new Date(b.created) - new Date(a.created));
+    res.json(images);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// SSE log stream — sends buffered history then streams new entries live
+app.get('/ui/api/logs', (req, res) => {
+  res.set({
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+  res.flushHeaders();
+
+  // Send existing buffer so the UI shows past logs immediately on connect
+  for (const entry of logBuffer) {
+    res.write(`data: ${JSON.stringify(entry)}\n\n`);
+  }
+
+  // Keep-alive ping every 25 s to prevent proxy/browser timeouts
+  const keepAlive = setInterval(() => res.write(': ping\n\n'), 25000);
+
+  sseClients.add(res);
+  req.on('close', () => {
+    clearInterval(keepAlive);
+    sseClients.delete(res);
+  });
+});
+
+// ------------------- Image Upload -------------------
 app.post('/upload', verifyApiKey, upload.single('image'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No image file' });
 
@@ -189,9 +328,10 @@ app.post('/upload', verifyApiKey, upload.single('image'), async (req, res) => {
   }
 });
 
+// ------------------- Image Retrieval -------------------
 app.get('/img/:id', async (req, res) => {
   const { id } = req.params;
-  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) {
+  if (!UUID_RE.test(id)) {
     return res.status(400).send('Invalid ID');
   }
   try {
@@ -205,6 +345,7 @@ app.get('/img/:id', async (req, res) => {
   }
 });
 
+// ------------------- Error Handler -------------------
 app.use((err, req, res, next) => {
   if (err instanceof multer.MulterError) {
     return res.status(413).json({ error: 'File too large' });
@@ -214,4 +355,5 @@ app.use((err, req, res, next) => {
 
 app.listen(PORT, () => {
   console.log(`Image engine listening on http://127.0.0.1:${PORT}`);
+  console.log(`Dashboard UI available at http://127.0.0.1:${PORT}/ui`);
 });
