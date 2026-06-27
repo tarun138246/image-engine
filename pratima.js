@@ -135,6 +135,17 @@ const WAIT_KEY       = 'semaphore:wait';
 await redis.set(ACTIVE_KEY, 0);
 await redis.del(WAIT_KEY);
 
+// ------------------- Startup migration -------------------
+// Backfill apiKey for any companies created before per-company keys were introduced
+await withCompaniesLock(async () => {
+  const list = await loadCompanies();
+  const changed = list.filter(co => !co.apiKey);
+  if (changed.length === 0) return;
+  changed.forEach(co => { co.apiKey = generateCompanyKey(); });
+  await saveCompanies(list);
+  console.log(`Migrated ${changed.length} existing company/companies with new API keys`);
+});
+
 redis.defineCommand('acquireSemaphore', {
   numberOfKeys: 2,
   lua: `
@@ -206,6 +217,11 @@ function decryptBuffer(buf) {
   return Buffer.concat([decipher.update(data), decipher.final()]);
 }
 
+// ------------------- Per-company key helper -------------------
+function generateCompanyKey() {
+  return 'prtm_' + crypto.randomBytes(24).toString('hex'); // 53-char unguessable key
+}
+
 // ------------------- Validation helpers -------------------
 // FIX: strict regex prevents path-traversal in image_id
 const COMPANY_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -269,7 +285,7 @@ app.post('/companies', verifyApiKey, mgmtLimiter, async (req, res) => {
   if (!name || typeof name !== 'string' || !name.trim()) {
     return res.status(400).json({ error: 'Company name is required' });
   }
-  const company = { id: uuidv4(), name: name.trim(), created: new Date().toISOString() };
+  const company = { id: uuidv4(), name: name.trim(), apiKey: generateCompanyKey(), created: new Date().toISOString() };
   await withCompaniesLock(async () => {
     const list = await loadCompanies();
     list.push(company);
@@ -314,16 +330,21 @@ const upload = multer({
   },
 });
 
-app.post('/upload', verifyApiKey, uploadLimiter, upload.single('image'), async (req, res) => {
+app.post('/upload', uploadLimiter, upload.single('image'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No valid image file provided (accepted: JPEG, PNG, WebP, GIF, TIFF)' });
 
   const companyId = req.body.company_id || req.query.company_id;
-  if (!companyId)                     return res.status(400).json({ error: 'company_id is required' });
+  if (!companyId)                       return res.status(400).json({ error: 'company_id is required' });
   if (!COMPANY_UUID_RE.test(companyId)) return res.status(400).json({ error: 'Invalid company_id format' });
 
   const companies = await loadCompanies();
   const company   = companies.find(c => c.id === companyId);
   if (!company) return res.status(404).json({ error: 'Company not found' });
+
+  // Each company authenticates with its own key — not the global admin key
+  if (req.headers['x-api-key'] !== company.apiKey) {
+    return res.status(403).json({ error: 'Invalid API key for this company' });
+  }
 
   await acquireSlot();
   try {

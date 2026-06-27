@@ -770,12 +770,22 @@
       return;
     }
     list.innerHTML = companies.map(function(c) {
+      const keyHtml = c.apiKey
+        ? '<code style="font-family:var(--font-mono);font-size:11px;color:var(--green);' +
+            'background:var(--surface-2);padding:2px 7px;border-radius:4px;border:1px solid var(--border)">' +
+            esc(c.apiKey) + '</code>' +
+          '<button class="btn btn-sm" data-copy="' + esc(c.apiKey) + '" onclick="copyText(this.dataset.copy)" style="margin-left:6px;">Copy Key</button>'
+        : '<span style="color:var(--muted)">—</span>';
+
       return '<div class="company-card">' +
         '<div class="company-info">' +
           '<div class="company-name">' + esc(c.name) + '</div>' +
           '<div class="company-meta">ID: ' + esc(c.id) + ' · Created: ' + fmtDate(c.created) + '</div>' +
+          '<div class="company-meta" style="margin-top:6px;display:flex;align-items:center;flex-wrap:wrap;gap:4px;">' +
+            '<span style="color:var(--muted);margin-right:4px;">API Key:</span>' + keyHtml +
+          '</div>' +
         '</div>' +
-        '<button class="btn btn-danger btn-sm" onclick="deleteCompany(\'' + esc(c.id) + '\',\'' + esc(c.name) + '\')">Delete</button>' +
+        '<button class="btn btn-danger btn-sm" style="flex-shrink:0;" onclick="deleteCompany(\'' + esc(c.id) + '\',\'' + esc(c.name) + '\')">Delete</button>' +
       '</div>';
     }).join('');
   }
@@ -791,9 +801,17 @@
         body: JSON.stringify({ name }),
       });
       if (!r.ok) throw new Error((await r.json()).error);
+      const company = await r.json();
       input.value = '';
       loadCompanies();
       loadStats();
+      // Auto-copy the new company's API key so it's ready to share
+      if (company.apiKey && navigator.clipboard) {
+        navigator.clipboard.writeText(company.apiKey)
+          .then(() => showToast('Company created! API key copied to clipboard'));
+      } else {
+        showToast('Company created!');
+      }
     } catch (e) {
       alert('Create failed: ' + e.message);
     }
@@ -922,6 +940,12 @@
   function copyUrl() {
     if (navigator.clipboard) {
       navigator.clipboard.writeText(currentModalUrl).then(() => showToast('URL copied!'));
+    }
+  }
+
+  function copyText(text) {
+    if (navigator.clipboard) {
+      navigator.clipboard.writeText(text).then(() => showToast('Copied!'));
     }
   }
 
