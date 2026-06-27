@@ -1,9 +1,10 @@
+<!-- ui.html -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Image Engine · Dashboard</title>
+  <title>Pratima · Dashboard</title>
   <style>
     :root {
       --bg: #080b0e;
@@ -180,6 +181,15 @@
     }
     .btn:hover { background: var(--surface-2); border-color: var(--border-2); color: var(--text); }
     .btn-sm { padding: 4px 10px; font-size: 11px; border-radius: 6px; }
+    .btn-danger { color: var(--red); border-color: rgba(239,68,68,0.3); }
+    .btn-danger:hover { background: var(--red-dim); }
+    .btn-primary {
+      background: var(--green);
+      color: #000;
+      border-color: var(--green);
+      font-weight: 600;
+    }
+    .btn-primary:hover { background: #0ea774; border-color: #0ea774; color: #000; }
 
     /* ---- Toolbar ---- */
     .toolbar { display: flex; align-items: center; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; }
@@ -219,6 +229,21 @@
     .img-size { font-size: 10px; color: var(--muted); }
     .img-date { font-size: 10px; color: var(--muted); }
 
+    /* ---- Company card ---- */
+    .company-list { display: flex; flex-direction: column; gap: 8px; }
+    .company-card {
+      display: flex;
+      align-items: center;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 12px 16px;
+      gap: 12px;
+    }
+    .company-info { flex: 1; }
+    .company-name { font-weight: 600; }
+    .company-meta { font-size: 11px; color: var(--muted); }
+
     /* ---- Logs ---- */
     .filter-pills { display: flex; gap: 6px; }
     .pill {
@@ -234,10 +259,10 @@
       user-select: none;
     }
     .pill:hover { color: var(--text); border-color: var(--border-2); }
-    .pill.active-all { background: var(--surface-2); color: var(--text); border-color: var(--border-2); }
-    .pill.active-info { background: var(--blue-dim); color: var(--blue); border-color: rgba(59,130,246,0.3); }
-    .pill.active-warn { background: var(--yellow-dim); color: var(--yellow); border-color: rgba(245,158,11,0.3); }
-    .pill.active-error { background: var(--red-dim); color: var(--red); border-color: rgba(239,68,68,0.3); }
+    .pill.active-all   { background: var(--surface-2); color: var(--text);   border-color: var(--border-2); }
+    .pill.active-info  { background: var(--blue-dim);  color: var(--blue);   border-color: rgba(59,130,246,0.3); }
+    .pill.active-warn  { background: var(--yellow-dim);color: var(--yellow); border-color: rgba(245,158,11,0.3); }
+    .pill.active-error { background: var(--red-dim);   color: var(--red);    border-color: rgba(239,68,68,0.3); }
 
     .logs-wrap {
       background: var(--surface);
@@ -259,18 +284,18 @@
     }
     .log-row:hover { background: rgba(255,255,255,0.025); }
     .log-time { color: var(--muted); font-size: 10px; }
-    .log-lvl { font-size: 9px; font-weight: 700; letter-spacing: 0.5px; }
-    .lvl-info { color: var(--blue); }
-    .lvl-warn { color: var(--yellow); }
+    .log-lvl  { font-size: 9px; font-weight: 700; letter-spacing: 0.5px; }
+    .lvl-info  { color: var(--blue); }
+    .lvl-warn  { color: var(--yellow); }
     .lvl-error { color: var(--red); }
     .log-msg { color: var(--text); word-break: break-all; }
     .log-msg.is-error { color: #fca5a5; }
-    .log-msg.is-warn { color: #fde68a; }
+    .log-msg.is-warn  { color: #fde68a; }
     .log-bottom { height: 1px; }
 
     /* ---- Empty / loading states ---- */
     .empty-state { padding: 60px 20px; text-align: center; color: var(--muted); grid-column: 1/-1; }
-    .empty-icon { font-size: 40px; margin-bottom: 12px; opacity: 0.5; }
+    .empty-icon  { font-size: 40px; margin-bottom: 12px; opacity: 0.5; }
     .empty-title { font-size: 15px; color: var(--muted-2); margin-bottom: 6px; }
     .loading-center { display: flex; align-items: center; justify-content: center; padding: 60px; grid-column: 1/-1; }
     .spinner {
@@ -327,15 +352,8 @@
     .modal-img-wrap { width: 100%; border-radius: 8px; overflow: hidden; background: var(--surface-2); margin-bottom: 16px; }
     .modal-img { width: 100%; max-height: 420px; object-fit: contain; display: block; }
     .modal-actions { display: flex; gap: 8px; padding: 14px 18px; border-top: 1px solid var(--border); }
-    .btn-primary {
-      background: var(--green);
-      color: #000;
-      border-color: var(--green);
-      font-weight: 600;
-    }
-    .btn-primary:hover { background: #0ea774; border-color: #0ea774; color: #000; }
 
-    /* ---- Copy feedback ---- */
+    /* ---- Copy toast ---- */
     .copied-toast {
       position: fixed; bottom: 24px; right: 24px;
       background: var(--surface-2); border: 1px solid var(--green);
@@ -346,6 +364,44 @@
       pointer-events: none; z-index: 999;
     }
     .copied-toast.show { opacity: 1; transform: translateY(0); }
+
+    /* ---- API Key overlay ---- */
+    .key-overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.88);
+      z-index: 500;
+      align-items: center;
+      justify-content: center;
+      backdrop-filter: blur(6px);
+    }
+    .key-overlay.open { display: flex; }
+    .key-box {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 32px;
+      width: min(400px, 92vw);
+      box-shadow: 0 24px 60px rgba(0,0,0,0.7);
+    }
+    .key-title { font-size: 17px; font-weight: 700; margin-bottom: 6px; }
+    .key-sub   { font-size: 12px; color: var(--muted); margin-bottom: 22px; line-height: 1.6; }
+    .key-input {
+      width: 100%;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      border-radius: 7px;
+      color: var(--text);
+      font-size: 13px;
+      font-family: var(--font-mono);
+      padding: 9px 12px;
+      outline: none;
+      margin-bottom: 12px;
+      transition: border-color 0.15s;
+    }
+    .key-input:focus { border-color: var(--green); }
+    .key-input::placeholder { color: var(--muted); }
 
     /* ---- Responsive ---- */
     @media (max-width: 640px) {
@@ -358,11 +414,22 @@
 </head>
 <body>
 
+<!-- API Key overlay — shown on first visit or after key reset -->
+<div class="key-overlay" id="key-overlay">
+  <div class="key-box">
+    <div class="key-title">Enter API Key</div>
+    <div class="key-sub">Your API key is stored only in this browser (localStorage) and is never sent to any third party. It is included as the <code style="font-family:var(--font-mono);font-size:11px;color:var(--green)">x-api-key</code> header on every management request.</div>
+    <input class="key-input" id="key-input" type="password" placeholder="Paste your API key…"
+      onkeydown="if(event.key==='Enter')saveKey()" autocomplete="current-password" />
+    <button class="btn btn-primary" style="width:100%;justify-content:center;padding:9px 0;" onclick="saveKey()">Connect</button>
+  </div>
+</div>
+
 <!-- Header -->
 <header class="header">
   <div class="logo">
     <div class="logo-icon">⚡</div>
-    Image Engine
+    Pratima
   </div>
   <span class="header-uptime" id="header-uptime">—</span>
   <div class="header-right">
@@ -370,12 +437,16 @@
       <div class="pulse-dot"></div>
       Online
     </div>
+    <button class="btn btn-sm" onclick="resetKey()" title="Change API key" style="color:var(--muted)">⚙ Key</button>
   </div>
 </header>
 
 <!-- Tabs -->
 <nav class="tabs">
   <div class="tab active" data-tab="dashboard" onclick="switchTab('dashboard')">Dashboard</div>
+  <div class="tab" data-tab="companies" onclick="switchTab('companies')">
+    Companies <span class="tab-badge" id="tab-companies-count">—</span>
+  </div>
   <div class="tab" data-tab="images" onclick="switchTab('images')">
     Images <span class="tab-badge" id="tab-images-count">—</span>
   </div>
@@ -387,10 +458,11 @@
 <!-- Content -->
 <div class="content">
 
-  <!-- ===== Dashboard Panel ===== -->
+  <!-- Dashboard -->
   <div class="panel active" id="panel-dashboard">
     <div class="stats-row" id="stats-row">
-      <div class="stat-card"><div class="stat-label">Total Images</div><div class="stat-value" id="s-count">—</div><div class="stat-sub">stored images</div></div>
+      <div class="stat-card"><div class="stat-label">Total Images</div><div class="stat-value" id="s-count">—</div><div class="stat-sub">across all companies</div></div>
+      <div class="stat-card"><div class="stat-label">Companies</div><div class="stat-value" id="s-companies">—</div><div class="stat-sub">active companies</div></div>
       <div class="stat-card"><div class="stat-label">Storage Used</div><div class="stat-value" id="s-storage">—</div><div class="stat-sub" id="s-storage-sub">calculating…</div></div>
       <div class="stat-card"><div class="stat-label">Uptime</div><div class="stat-value" id="s-uptime">—</div><div class="stat-sub">since last restart</div></div>
       <div class="stat-card"><div class="stat-label">Redis</div><div class="stat-value" id="s-redis">—</div><div class="stat-sub">distributed semaphore</div></div>
@@ -408,13 +480,14 @@
     <div class="section">
       <div class="section-header"><span class="section-title">API Endpoints</span></div>
       <div class="data-table">
-        <div class="data-row"><span class="data-key">Health Check</span><span class="data-val">GET &nbsp;/health</span></div>
-        <div class="data-row"><span class="data-key">Upload Image</span><span class="data-val">POST /upload &nbsp; &nbsp;· x-api-key header required</span></div>
-        <div class="data-row"><span class="data-key">Retrieve Image</span><span class="data-val">GET &nbsp;/img/:uuid</span></div>
-        <div class="data-row"><span class="data-key">Dashboard UI</span><span class="data-val">GET &nbsp;/ui</span></div>
-        <div class="data-row"><span class="data-key">Stats API</span><span class="data-val">GET &nbsp;/ui/api/stats</span></div>
-        <div class="data-row"><span class="data-key">Images API</span><span class="data-val">GET &nbsp;/ui/api/images</span></div>
-        <div class="data-row"><span class="data-key">Logs Stream</span><span class="data-val">GET &nbsp;/ui/api/logs &nbsp; · SSE</span></div>
+        <div class="data-row"><span class="data-key">Health Check</span><span class="data-val">GET /health</span></div>
+        <div class="data-row"><span class="data-key">Upload Image</span><span class="data-val">POST /upload · x-api-key header · multipart/form-data · company_id required</span></div>
+        <div class="data-row"><span class="data-key">Retrieve Image</span><span class="data-val">GET /img/:company_id/:image_id</span></div>
+        <div class="data-row"><span class="data-key">Companies</span><span class="data-val">GET /companies · POST /companies · DELETE /companies/:id · all require x-api-key</span></div>
+        <div class="data-row"><span class="data-key">Dashboard UI</span><span class="data-val">GET /ui</span></div>
+        <div class="data-row"><span class="data-key">Stats API</span><span class="data-val">GET /ui/api/stats</span></div>
+        <div class="data-row"><span class="data-key">Images API</span><span class="data-val">GET /ui/api/images?company_id=…</span></div>
+        <div class="data-row"><span class="data-key">Logs Stream</span><span class="data-val">GET /ui/api/logs · SSE</span></div>
       </div>
     </div>
 
@@ -422,20 +495,37 @@
       <div class="section-header"><span class="section-title">Security</span></div>
       <div class="data-table">
         <div class="data-row"><span class="data-key">Encryption</span><span class="data-val">AES-256-GCM · per-file random IV · 16-byte auth tag</span></div>
-        <div class="data-row"><span class="data-key">Auth</span><span class="data-val">x-api-key header (upload only)</span></div>
+        <div class="data-row"><span class="data-key">Auth</span><span class="data-val">x-api-key header (upload, company management, /companies GET)</span></div>
         <div class="data-row"><span class="data-key">Accepted formats</span><span class="data-val">JPEG · PNG · WebP · GIF · TIFF</span></div>
-        <div class="data-row"><span class="data-key">Output format</span><span class="data-val">WebP (metadata stripped)</span></div>
+        <div class="data-row"><span class="data-key">Output format</span><span class="data-val">WebP (original dimensions, EXIF/metadata stripped)</span></div>
         <div class="data-row"><span class="data-key">File permissions</span><span class="data-val">0o600 (owner read/write only)</span></div>
         <div class="data-row"><span class="data-key">Malware scan</span><span class="data-val" id="sec-clamav">—</span></div>
+        <div class="data-row"><span class="data-key">Path traversal</span><span class="data-val">Strict regex on image_id — only [a-z0-9_] chars permitted</span></div>
+        <div class="data-row"><span class="data-key">Rate limiting</span><span class="data-val">30 uploads/min · 20 management calls/min · 300 global/min</span></div>
       </div>
     </div>
   </div>
 
-  <!-- ===== Images Panel ===== -->
+  <!-- Companies -->
+  <div class="panel" id="panel-companies">
+    <div class="toolbar">
+      <input class="search-box" type="text" placeholder="New company name…" id="new-company-name" />
+      <button class="btn" onclick="createCompany()">+ Add Company</button>
+      <span class="ml-auto" style="font-size:12px; color:var(--muted)">Manage companies</span>
+    </div>
+    <div class="company-list" id="company-list">
+      <div class="loading-center"><div class="spinner"></div></div>
+    </div>
+  </div>
+
+  <!-- Images -->
   <div class="panel" id="panel-images">
     <div class="toolbar">
+      <select id="company-selector" class="search-box" style="min-width:180px" onchange="onCompanyFilterChange()">
+        <option value="">All companies</option>
+      </select>
       <input class="search-box" type="text" placeholder="Search by image ID…" id="img-search" oninput="filterImages(this.value)" />
-      <button class="btn" onclick="loadImages()">↻ &nbsp;Refresh</button>
+      <button class="btn" onclick="loadImages()">↻ Refresh</button>
       <span class="ml-auto" style="font-size:12px; color:var(--muted)" id="img-count-label">—</span>
     </div>
     <div class="images-grid" id="images-grid">
@@ -443,14 +533,14 @@
     </div>
   </div>
 
-  <!-- ===== Logs Panel ===== -->
+  <!-- Logs -->
   <div class="panel" id="panel-logs">
     <div class="toolbar">
       <div class="filter-pills">
-        <button class="pill active-all" id="pill-all" onclick="setFilter('all')">All</button>
-        <button class="pill" id="pill-info" onclick="setFilter('info')">Info</button>
-        <button class="pill" id="pill-warn" onclick="setFilter('warn')">Warn</button>
-        <button class="pill" id="pill-error" onclick="setFilter('error')">Error</button>
+        <button class="pill active-all" id="pill-all"   onclick="setFilter('all')">All</button>
+        <button class="pill"            id="pill-info"  onclick="setFilter('info')">Info</button>
+        <button class="pill"            id="pill-warn"  onclick="setFilter('warn')">Warn</button>
+        <button class="pill"            id="pill-error" onclick="setFilter('error')">Error</button>
       </div>
       <div class="ml-auto" style="display:flex;gap:8px;align-items:center;">
         <label style="display:flex;align-items:center;gap:5px;font-size:12px;color:var(--muted);cursor:pointer;">
@@ -461,7 +551,8 @@
       </div>
     </div>
     <div class="logs-wrap" id="logs-wrap">
-      <div style="padding:20px;color:var(--muted);text-align:center;font-size:12px;">Connecting to log stream…</div>
+      <!-- FIX: placeholder identified by id, not by div[style] selector -->
+      <div id="log-placeholder" style="padding:20px;color:var(--muted);text-align:center;font-size:12px;">Connecting to log stream…</div>
     </div>
   </div>
 
@@ -492,29 +583,79 @@
 <div class="copied-toast" id="toast">Copied to clipboard</div>
 
 <script>
+  // ---- API Key auth ----
+  // FIX: stored API key is sent as x-api-key on every management request.
+  // The server added verifyApiKey to GET /companies, so the dashboard
+  // now works correctly from any IP, not just localhost.
+  let apiKey = localStorage.getItem('pratima_apikey') || '';
+
+  function authHeaders(extra) {
+    return Object.assign({ 'x-api-key': apiKey }, extra || {});
+  }
+
+  function showKeyOverlay() {
+    document.getElementById('key-overlay').classList.add('open');
+    document.getElementById('key-input').focus();
+  }
+
+  function hideKeyOverlay() {
+    document.getElementById('key-overlay').classList.remove('open');
+  }
+
+  function saveKey() {
+    const k = document.getElementById('key-input').value.trim();
+    if (!k) { document.getElementById('key-input').focus(); return; }
+    apiKey = k;
+    localStorage.setItem('pratima_apikey', k);
+    document.getElementById('key-input').value = '';
+    hideKeyOverlay();
+    init();
+  }
+
+  function resetKey() {
+    localStorage.removeItem('pratima_apikey');
+    apiKey = '';
+    showKeyOverlay();
+  }
+
+  // Show 403 as key prompt so user can re-enter a wrong key
+  async function apiFetch(url, options) {
+    options = options || {};
+    const headers = authHeaders(options.headers || {});
+    const res = await fetch(url, Object.assign({}, options, { headers }));
+    if (res.status === 403) {
+      showKeyOverlay();
+      throw new Error('Invalid API key — please re-enter your key');
+    }
+    return res;
+  }
+
   // ---- State ----
-  let allImages = [];
-  let allLogs = [];
-  let logFilter = 'all';
-  let activeTab = 'dashboard';
-  let imagesLoaded = false;
+  let allImages     = [];
+  let allLogs       = [];
+  let logFilter     = 'all';
+  let activeTab     = 'dashboard';
+  let imagesLoaded  = false;
   let currentModalUrl = '';
+  let companies     = [];
+
+  // FIX: image data stored in a Map keyed by card id — no inline JSON in HTML attributes
+  const imageDataMap = new Map();
+  let   imgSeq       = 0;
 
   // ---- Helpers ----
   function fmtBytes(b) {
     if (b === 0) return '0 B';
-    if (b < 1024) return b + ' B';
-    if (b < 1048576) return (b / 1024).toFixed(1) + ' KB';
+    if (b < 1024)       return b + ' B';
+    if (b < 1048576)    return (b / 1024).toFixed(1) + ' KB';
     if (b < 1073741824) return (b / 1048576).toFixed(1) + ' MB';
     return (b / 1073741824).toFixed(2) + ' GB';
   }
 
   function fmtUptime(s) {
     s = Math.floor(s);
-    const d = Math.floor(s / 86400);
-    const h = Math.floor((s % 86400) / 3600);
-    const m = Math.floor((s % 3600) / 60);
-    const sec = s % 60;
+    const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600),
+          m = Math.floor((s % 3600) / 60), sec = s % 60;
     if (d > 0) return d + 'd ' + h + 'h ' + m + 'm';
     if (h > 0) return h + 'h ' + m + 'm';
     if (m > 0) return m + 'm ' + sec + 's';
@@ -524,7 +665,7 @@
   function fmtDate(iso) {
     const d = new Date(iso);
     return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })
-      + ' ' + d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+         + ' ' + d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
   }
 
   function fmtTime(iso) {
@@ -532,11 +673,12 @@
   }
 
   function esc(s) {
-    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    return String(s)
+      .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
   }
 
   function badge(status) {
-    if (status === 'connected') return '<span class="badge badge-green">● Connected</span>';
+    if (status === 'connected')   return '<span class="badge badge-green">● Connected</span>';
     if (status === 'unavailable') return '<span class="badge badge-yellow">⚠ Unavailable</span>';
     return '<span class="badge badge-red">✕ Disconnected</span>';
   }
@@ -554,7 +696,8 @@
     document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === name));
     document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
     document.getElementById('panel-' + name).classList.add('active');
-    if (name === 'images' && !imagesLoaded) loadImages();
+    if (name === 'images'    && !imagesLoaded) loadImages();
+    if (name === 'companies')                  loadCompanies();
   }
 
   // ---- Stats ----
@@ -564,105 +707,213 @@
       if (!r.ok) throw new Error(r.statusText);
       const d = await r.json();
 
-      document.getElementById('s-count').textContent = d.imageCount.toLocaleString();
-      document.getElementById('tab-images-count').textContent = d.imageCount;
+      document.getElementById('s-count').textContent     = d.imageCount.toLocaleString();
+      document.getElementById('s-companies').textContent = d.companyCount;
+      document.getElementById('tab-images-count').textContent    = d.imageCount;
+      document.getElementById('tab-companies-count').textContent = d.companyCount;
 
       const storage = fmtBytes(d.storageBytes);
       const [val, unit] = storage.split(' ');
-      document.getElementById('s-storage').textContent = val;
+      document.getElementById('s-storage').textContent     = val;
       document.getElementById('s-storage-sub').textContent = (unit || '') + ' used';
 
-      document.getElementById('s-uptime').textContent = fmtUptime(d.uptime);
-      document.getElementById('header-uptime').textContent = 'up ' + fmtUptime(d.uptime);
-      document.getElementById('s-redis').innerHTML = badge(d.redisStatus);
-      document.getElementById('s-clamav').innerHTML = badge(d.clamavStatus);
-      document.getElementById('sec-clamav').textContent = d.clamavStatus === 'connected' ? 'ClamAV daemon active' : 'ClamAV unavailable (uploads proceed)';
-      document.getElementById('s-slots').textContent = d.activeSlots;
-      document.getElementById('s-limit').textContent = d.config.concurrencyLimit;
+      document.getElementById('s-uptime').textContent        = fmtUptime(d.uptime);
+      document.getElementById('header-uptime').textContent   = 'up ' + fmtUptime(d.uptime);
+      document.getElementById('s-redis').innerHTML           = badge(d.redisStatus);
+      document.getElementById('s-clamav').innerHTML          = badge(d.clamavStatus);
+      document.getElementById('sec-clamav').textContent      =
+        d.clamavStatus === 'connected' ? 'ClamAV daemon active' : 'ClamAV unavailable (uploads proceed)';
+      document.getElementById('s-slots').textContent  = d.activeSlots;
+      document.getElementById('s-limit').textContent  = d.config.concurrencyLimit;
 
       const cfg = d.config;
       document.getElementById('cfg-table').innerHTML = [
-        ['Port', cfg.port],
-        ['Public URL', cfg.publicUrl],
-        ['Storage Path', cfg.storagePath],
-        ['Max File Size', fmtBytes(cfg.maxFileSize)],
-        ['WebP Quality', cfg.webpQuality + ' / 100'],
+        ['Port',              cfg.port],
+        ['Public URL',        cfg.publicUrl],
+        ['Storage Path',      cfg.storagePath],
+        ['Max File Size',     fmtBytes(cfg.maxFileSize)],
+        ['WebP Quality',      cfg.webpQuality + ' / 100'],
         ['Concurrency Limit', cfg.concurrencyLimit + ' concurrent uploads'],
-        ['Node.js Uptime', fmtUptime(d.uptime)],
-        ['Memory (RSS)', fmtBytes(d.memoryRss || 0)],
+        ['Node.js Uptime',    fmtUptime(d.uptime)],
+        ['Memory (RSS)',      fmtBytes(d.memoryRss || 0)],
       ].map(function(row) {
-        return '<div class="data-row"><span class="data-key">' + esc(row[0]) + '</span><span class="data-val">' + esc(row[1]) + '</span></div>';
+        return '<div class="data-row"><span class="data-key">' + esc(row[0]) +
+               '</span><span class="data-val">' + esc(row[1]) + '</span></div>';
       }).join('');
     } catch (e) {
       console.warn('Stats fetch failed:', e.message);
     }
   }
 
+  // ---- Companies ----
+  async function loadCompanies() {
+    document.getElementById('company-list').innerHTML = '<div class="loading-center"><div class="spinner"></div></div>';
+    try {
+      const r = await apiFetch('/companies');
+      if (!r.ok) throw new Error(r.statusText);
+      companies = await r.json();
+      renderCompanies();
+      populateCompanySelector();
+    } catch (e) {
+      document.getElementById('company-list').innerHTML =
+        '<div class="empty-state"><div class="empty-icon">⚠</div>' +
+        '<div class="empty-title">Failed to load companies</div><div>' + esc(e.message) + '</div></div>';
+    }
+  }
+
+  function renderCompanies() {
+    const list = document.getElementById('company-list');
+    if (companies.length === 0) {
+      list.innerHTML =
+        '<div class="empty-state"><div class="empty-icon">🏢</div>' +
+        '<div class="empty-title">No companies yet</div><div>Create one using the form above</div></div>';
+      return;
+    }
+    list.innerHTML = companies.map(function(c) {
+      return '<div class="company-card">' +
+        '<div class="company-info">' +
+          '<div class="company-name">' + esc(c.name) + '</div>' +
+          '<div class="company-meta">ID: ' + esc(c.id) + ' · Created: ' + fmtDate(c.created) + '</div>' +
+        '</div>' +
+        '<button class="btn btn-danger btn-sm" onclick="deleteCompany(\'' + esc(c.id) + '\',\'' + esc(c.name) + '\')">Delete</button>' +
+      '</div>';
+    }).join('');
+  }
+
+  async function createCompany() {
+    const input = document.getElementById('new-company-name');
+    const name  = input.value.trim();
+    if (!name) return alert('Please enter a company name');
+    try {
+      const r = await apiFetch('/companies', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name }),
+      });
+      if (!r.ok) throw new Error((await r.json()).error);
+      input.value = '';
+      loadCompanies();
+      loadStats();
+    } catch (e) {
+      alert('Create failed: ' + e.message);
+    }
+  }
+
+  async function deleteCompany(id, name) {
+    if (!confirm('Delete company "' + name + '" and ALL its images? This cannot be undone.')) return;
+    try {
+      const r = await apiFetch('/companies/' + encodeURIComponent(id), { method: 'DELETE' });
+      if (!r.ok) throw new Error((await r.json()).error);
+      loadCompanies();
+      loadStats();
+    } catch (e) {
+      alert('Delete failed: ' + e.message);
+    }
+  }
+
+  function populateCompanySelector() {
+    const sel = document.getElementById('company-selector');
+    const cur = sel.value;
+    sel.innerHTML = '<option value="">All companies</option>' +
+      companies.map(c => '<option value="' + esc(c.id) + '">' + esc(c.name) + '</option>').join('');
+    if (companies.find(c => c.id === cur)) sel.value = cur;
+  }
+
   // ---- Images ----
   async function loadImages() {
     document.getElementById('images-grid').innerHTML = '<div class="loading-center"><div class="spinner"></div></div>';
     try {
-      const r = await fetch('/ui/api/images');
+      const companyId = document.getElementById('company-selector').value;
+      let url = '/ui/api/images';
+      if (companyId) url += '?company_id=' + encodeURIComponent(companyId);
+      const r = await fetch(url);
       if (!r.ok) throw new Error(r.statusText);
-      allImages = await r.json();
+      allImages    = await r.json();
       imagesLoaded = true;
       renderImages(allImages);
     } catch (e) {
       document.getElementById('images-grid').innerHTML =
-        '<div class="empty-state"><div class="empty-icon">⚠</div><div class="empty-title">Failed to load images</div><div>' + esc(e.message) + '</div></div>';
+        '<div class="empty-state"><div class="empty-icon">⚠</div>' +
+        '<div class="empty-title">Failed to load images</div><div>' + esc(e.message) + '</div></div>';
     }
   }
 
   function renderImages(imgs) {
     const grid = document.getElementById('images-grid');
     document.getElementById('img-count-label').textContent = imgs.length + ' image' + (imgs.length !== 1 ? 's' : '');
+
+    // FIX: clear and rebuild the imageDataMap; no JSON embedded in HTML attributes
+    imageDataMap.clear();
+
     if (imgs.length === 0) {
-      grid.innerHTML = '<div class="empty-state"><div class="empty-icon">🖼</div><div class="empty-title">No images yet</div><div>Upload images via the API to see them here</div></div>';
+      grid.innerHTML =
+        '<div class="empty-state"><div class="empty-icon">🖼</div>' +
+        '<div class="empty-title">No images yet</div><div>Upload images via the API</div></div>';
       return;
     }
+
     grid.innerHTML = imgs.map(function(img) {
-      return '<div class="img-card" onclick=\'openModal(' + JSON.stringify(img).replace(/'/g, "\\'") + ')\'>' +
+      const key = 'i' + (imgSeq++);
+      imageDataMap.set(key, img);
+
+      const coLabel = img.company_name
+        ? '<div class="img-id" style="color:var(--green)">' + esc(img.company_name) + '</div>'
+        : '';
+
+      return '<div class="img-card" data-key="' + key + '">' +
         '<div class="img-thumb-wrap">' +
           '<img class="img-thumb" src="' + esc(img.url) + '" alt="" loading="lazy" ' +
             'onerror="this.style.display=\'none\';this.nextElementSibling.style.display=\'flex\'" />' +
           '<div class="img-thumb-fail" style="display:none">🖼</div>' +
         '</div>' +
         '<div class="img-meta">' +
+          coLabel +
           '<div class="img-id" title="' + esc(img.id) + '">' + esc(img.id) + '</div>' +
           '<div class="img-row">' +
-            '<span class="img-size">' + esc(fmtBytes(img.size)) + '</span>' +
-            '<span class="img-date">' + esc(fmtDate(img.created)) + '</span>' +
+            '<span class="img-size">' + esc(fmtBytes(img.size))    + '</span>' +
+            '<span class="img-date">' + esc(fmtDate(img.created))  + '</span>' +
           '</div>' +
         '</div>' +
       '</div>';
     }).join('');
   }
 
+  // FIX: event delegation instead of inline onclick with embedded JSON
+  document.getElementById('images-grid').addEventListener('click', function(e) {
+    const card = e.target.closest('.img-card[data-key]');
+    if (!card) return;
+    const img = imageDataMap.get(card.dataset.key);
+    if (img) openModal(img);
+  });
+
   function filterImages(q) {
-    const filtered = q ? allImages.filter(function(i) { return i.id.toLowerCase().includes(q.toLowerCase()); }) : allImages;
-    renderImages(filtered);
+    const lq = q.toLowerCase();
+    renderImages(q ? allImages.filter(i => i.id.toLowerCase().includes(lq)) : allImages);
   }
+
+  function onCompanyFilterChange() { loadImages(); }
 
   // ---- Modal ----
   function openModal(img) {
     currentModalUrl = img.url;
-    document.getElementById('modal-img').src = img.url;
-    document.getElementById('modal-link').href = img.url;
-    document.getElementById('modal-meta').innerHTML = [
-      ['Image ID', img.id],
-      ['Public URL', img.url],
+    document.getElementById('modal-img').src     = img.url;
+    document.getElementById('modal-link').href   = img.url;
+    const meta = [
+      ['Image ID',       img.id],
+      ['Company',        img.company_name || '—'],
+      ['Public URL',     img.url],
       ['Encrypted size', fmtBytes(img.size)],
-      ['Uploaded', fmtDate(img.created)],
-      ['Format', 'WebP (AES-256-GCM encrypted at rest)'],
-    ].map(function(row) {
-      return '<div class="data-row"><span class="data-key">' + esc(row[0]) + '</span><span class="data-val">' + esc(row[1]) + '</span></div>';
+      ['Uploaded',       fmtDate(img.created)],
+      ['Format',         'WebP (AES-256-GCM encrypted at rest)'],
+    ];
+    document.getElementById('modal-meta').innerHTML = meta.map(function(row) {
+      return '<div class="data-row"><span class="data-key">' + esc(row[0]) +
+             '</span><span class="data-val">' + esc(row[1]) + '</span></div>';
     }).join('');
     document.getElementById('modal').classList.add('open');
   }
 
-  function closeModal() {
-    document.getElementById('modal').classList.remove('open');
-  }
+  function closeModal() { document.getElementById('modal').classList.remove('open'); }
 
   function handleModalClick(e) {
     if (e.target === document.getElementById('modal')) closeModal();
@@ -670,7 +921,7 @@
 
   function copyUrl() {
     if (navigator.clipboard) {
-      navigator.clipboard.writeText(currentModalUrl).then(function() { showToast('URL copied!'); });
+      navigator.clipboard.writeText(currentModalUrl).then(() => showToast('URL copied!'));
     }
   }
 
@@ -678,8 +929,7 @@
   function setFilter(f) {
     logFilter = f;
     ['all','info','warn','error'].forEach(function(k) {
-      const el = document.getElementById('pill-' + k);
-      el.className = 'pill' + (k === f ? ' active-' + f : '');
+      document.getElementById('pill-' + k).className = 'pill' + (k === f ? ' active-' + f : '');
     });
     renderLogs();
   }
@@ -692,21 +942,24 @@
 
   function renderLogs() {
     const wrap = document.getElementById('logs-wrap');
-    const filtered = logFilter === 'all' ? allLogs : allLogs.filter(function(l) { return l.level === logFilter; });
+    const filtered = logFilter === 'all' ? allLogs : allLogs.filter(l => l.level === logFilter);
     if (filtered.length === 0) {
       wrap.innerHTML = '<div style="padding:20px;color:var(--muted);text-align:center;font-size:12px;">No log entries</div>';
       return;
     }
     wrap.innerHTML = filtered.map(function(l) {
       return '<div class="log-row">' +
-        '<span class="log-time">' + fmtTime(l.time) + '</span>' +
+        '<span class="log-time">'  + fmtTime(l.time) + '</span>' +
         '<span class="log-lvl lvl-' + l.level + '">' + l.level.toUpperCase() + '</span>' +
-        '<span class="log-msg' + (l.level === 'error' ? ' is-error' : l.level === 'warn' ? ' is-warn' : '') + '">' + esc(l.message) + '</span>' +
+        '<span class="log-msg' + (l.level === 'error' ? ' is-error' : l.level === 'warn' ? ' is-warn' : '') + '">' +
+          esc(l.message) +
+        '</span>' +
       '</div>';
     }).join('') + '<div class="log-bottom" id="log-bottom"></div>';
+
     if (document.getElementById('autoscroll').checked) {
-      var anchor = document.getElementById('log-bottom');
-      if (anchor) anchor.scrollIntoView();
+      const a = document.getElementById('log-bottom');
+      if (a) a.scrollIntoView();
     }
   }
 
@@ -718,20 +971,27 @@
     if (logFilter !== 'all' && logFilter !== entry.level) return;
 
     const wrap = document.getElementById('logs-wrap');
-    const placeholder = wrap.querySelector('div[style]');
-    if (placeholder) wrap.innerHTML = '<div class="log-bottom" id="log-bottom"></div>';
+
+    // FIX: remove placeholder by its id — not by fragile div[style] selector
+    const placeholder = document.getElementById('log-placeholder');
+    if (placeholder) {
+      placeholder.remove();
+      wrap.innerHTML = '<div class="log-bottom" id="log-bottom"></div>';
+    }
 
     const row = document.createElement('div');
     row.className = 'log-row';
     row.innerHTML =
-      '<span class="log-time">' + fmtTime(entry.time) + '</span>' +
+      '<span class="log-time">'  + fmtTime(entry.time) + '</span>' +
       '<span class="log-lvl lvl-' + entry.level + '">' + entry.level.toUpperCase() + '</span>' +
-      '<span class="log-msg' + (entry.level === 'error' ? ' is-error' : entry.level === 'warn' ? ' is-warn' : '') + '">' + esc(entry.message) + '</span>';
+      '<span class="log-msg' + (entry.level === 'error' ? ' is-error' : entry.level === 'warn' ? ' is-warn' : '') + '">' +
+        esc(entry.message) +
+      '</span>';
 
     let anchor = document.getElementById('log-bottom');
     if (!anchor) {
       anchor = document.createElement('div');
-      anchor.id = 'log-bottom';
+      anchor.id        = 'log-bottom';
       anchor.className = 'log-bottom';
       wrap.appendChild(anchor);
     }
@@ -755,12 +1015,23 @@
   // ---- Keyboard ----
   document.addEventListener('keydown', function(e) {
     if (e.key === 'Escape') closeModal();
+    if (e.key === 'Enter' && document.getElementById('key-overlay').classList.contains('open')) saveKey();
   });
 
   // ---- Init ----
-  loadStats();
-  setInterval(loadStats, 20000);
-  connectSSE();
+  function init() {
+    loadStats();
+    loadCompanies();
+    setInterval(loadStats, 20_000);
+    connectSSE();
+  }
+
+  // Show key prompt if no key is stored, otherwise boot straight away
+  if (!apiKey) {
+    showKeyOverlay();
+  } else {
+    init();
+  }
 </script>
 </body>
 </html>
