@@ -240,6 +240,17 @@ async function fileExists(p) {
 const app = express();
 app.set('trust proxy', 1); // honour X-Forwarded-For behind nginx
 
+// CORS — must come before every other middleware so preflight OPTIONS requests
+// are answered before rate-limiting or auth runs
+app.use((req, res, next) => {
+  res.set('Access-Control-Allow-Origin',  '*');
+  res.set('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+  res.set('Access-Control-Allow-Headers', 'x-api-key, Content-Type');
+  res.set('Access-Control-Max-Age',       '86400'); // cache preflight for 24 h
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
 app.use(express.json({ limit: '16kb' }));
 
 // Global rate limit (generous baseline; specific routes tighten further)
