@@ -5,6 +5,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Pratima · Dashboard</title>
+  <!-- PRATIMA_API_KEY -->
   <style>
     :root {
       --bg: #080b0e;
@@ -190,6 +191,16 @@
       font-weight: 600;
     }
     .btn-primary:hover { background: #0ea774; border-color: #0ea774; color: #000; }
+    .btn-danger-solid {
+      background: var(--red);
+      color: #fff;
+      border-color: var(--red);
+    }
+    .btn-danger-solid:hover {
+      background: #dc2626;
+      border-color: #dc2626;
+      color: #fff;
+    }
 
     /* ---- Toolbar ---- */
     .toolbar { display: flex; align-items: center; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; }
@@ -209,6 +220,24 @@
     .ml-auto { margin-left: auto; }
 
     /* ---- Images grid ---- */
+    .images-section { margin-bottom: 30px; }
+    .company-header {
+      font-size: 14px;
+      font-weight: 600;
+      color: var(--green);
+      margin-bottom: 10px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 8px;
+    }
+    .company-header .img-count {
+      font-size: 11px;
+      font-weight: 400;
+      color: var(--muted);
+      font-family: var(--font-mono);
+    }
     .images-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 12px; }
     .img-card {
       background: var(--surface);
@@ -365,44 +394,6 @@
     }
     .copied-toast.show { opacity: 1; transform: translateY(0); }
 
-    /* ---- API Key overlay ---- */
-    .key-overlay {
-      display: none;
-      position: fixed;
-      inset: 0;
-      background: rgba(0,0,0,0.88);
-      z-index: 500;
-      align-items: center;
-      justify-content: center;
-      backdrop-filter: blur(6px);
-    }
-    .key-overlay.open { display: flex; }
-    .key-box {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 14px;
-      padding: 32px;
-      width: min(400px, 92vw);
-      box-shadow: 0 24px 60px rgba(0,0,0,0.7);
-    }
-    .key-title { font-size: 17px; font-weight: 700; margin-bottom: 6px; }
-    .key-sub   { font-size: 12px; color: var(--muted); margin-bottom: 22px; line-height: 1.6; }
-    .key-input {
-      width: 100%;
-      background: var(--surface-2);
-      border: 1px solid var(--border);
-      border-radius: 7px;
-      color: var(--text);
-      font-size: 13px;
-      font-family: var(--font-mono);
-      padding: 9px 12px;
-      outline: none;
-      margin-bottom: 12px;
-      transition: border-color 0.15s;
-    }
-    .key-input:focus { border-color: var(--green); }
-    .key-input::placeholder { color: var(--muted); }
-
     /* ---- Responsive ---- */
     @media (max-width: 640px) {
       .header { padding: 0 16px; }
@@ -413,17 +404,6 @@
   </style>
 </head>
 <body>
-
-<!-- API Key overlay — shown on first visit or after key reset -->
-<div class="key-overlay" id="key-overlay">
-  <div class="key-box">
-    <div class="key-title">Enter API Key</div>
-    <div class="key-sub">Your API key is stored only in this browser (localStorage) and is never sent to any third party. It is included as the <code style="font-family:var(--font-mono);font-size:11px;color:var(--green)">x-api-key</code> header on every management request.</div>
-    <input class="key-input" id="key-input" type="password" placeholder="Paste your API key…"
-      onkeydown="if(event.key==='Enter')saveKey()" autocomplete="current-password" />
-    <button class="btn btn-primary" style="width:100%;justify-content:center;padding:9px 0;" onclick="saveKey()">Connect</button>
-  </div>
-</div>
 
 <!-- Header -->
 <header class="header">
@@ -437,7 +417,6 @@
       <div class="pulse-dot"></div>
       Online
     </div>
-    <button class="btn btn-sm" onclick="resetKey()" title="Change API key" style="color:var(--muted)">⚙ Key</button>
   </div>
 </header>
 
@@ -483,6 +462,7 @@
         <div class="data-row"><span class="data-key">Health Check</span><span class="data-val">GET /health</span></div>
         <div class="data-row"><span class="data-key">Upload Image</span><span class="data-val">POST /upload · x-api-key header · multipart/form-data · company_id required</span></div>
         <div class="data-row"><span class="data-key">Retrieve Image</span><span class="data-val">GET /img/:company_id/:image_id</span></div>
+        <div class="data-row"><span class="data-key">Delete Image</span><span class="data-val">DELETE /img/:company_id/:image_id · company’s own API key</span></div>
         <div class="data-row"><span class="data-key">Companies</span><span class="data-val">GET /companies · POST /companies · DELETE /companies/:id · all require x-api-key</span></div>
         <div class="data-row"><span class="data-key">Dashboard UI</span><span class="data-val">GET /ui</span></div>
         <div class="data-row"><span class="data-key">Stats API</span><span class="data-val">GET /ui/api/stats</span></div>
@@ -518,17 +498,14 @@
     </div>
   </div>
 
-  <!-- Images -->
+  <!-- Images (grouped by company) -->
   <div class="panel" id="panel-images">
     <div class="toolbar">
-      <select id="company-selector" class="search-box" style="min-width:180px" onchange="onCompanyFilterChange()">
-        <option value="">All companies</option>
-      </select>
       <input class="search-box" type="text" placeholder="Search by image ID…" id="img-search" oninput="filterImages(this.value)" />
       <button class="btn" onclick="loadImages()">↻ Refresh</button>
       <span class="ml-auto" style="font-size:12px; color:var(--muted)" id="img-count-label">—</span>
     </div>
-    <div class="images-grid" id="images-grid">
+    <div id="images-container">
       <div class="loading-center"><div class="spinner"></div></div>
     </div>
   </div>
@@ -551,7 +528,6 @@
       </div>
     </div>
     <div class="logs-wrap" id="logs-wrap">
-      <!-- FIX: placeholder identified by id, not by div[style] selector -->
       <div id="log-placeholder" style="padding:20px;color:var(--muted);text-align:center;font-size:12px;">Connecting to log stream…</div>
     </div>
   </div>
@@ -576,6 +552,7 @@
         <button class="btn btn-primary">Open Full Image ↗</button>
       </a>
       <button class="btn" onclick="copyUrl()">Copy URL</button>
+      <button class="btn btn-danger-solid" onclick="deleteImage()">Delete Image</button>
     </div>
   </div>
 </div>
@@ -583,51 +560,11 @@
 <div class="copied-toast" id="toast">Copied to clipboard</div>
 
 <script>
-  // ---- API Key auth ----
-  // FIX: stored API key is sent as x-api-key on every management request.
-  // The server added verifyApiKey to GET /companies, so the dashboard
-  // now works correctly from any IP, not just localhost.
-  let apiKey = localStorage.getItem('pratima_apikey') || '';
+  // ---- Global admin key injected by server (no manual entry) ----
+  const apiKey = window.PRATIMA_GLOBAL_API_KEY || '';
 
-  function authHeaders(extra) {
-    return Object.assign({ 'x-api-key': apiKey }, extra || {});
-  }
-
-  function showKeyOverlay() {
-    document.getElementById('key-overlay').classList.add('open');
-    document.getElementById('key-input').focus();
-  }
-
-  function hideKeyOverlay() {
-    document.getElementById('key-overlay').classList.remove('open');
-  }
-
-  function saveKey() {
-    const k = document.getElementById('key-input').value.trim();
-    if (!k) { document.getElementById('key-input').focus(); return; }
-    apiKey = k;
-    localStorage.setItem('pratima_apikey', k);
-    document.getElementById('key-input').value = '';
-    hideKeyOverlay();
-    init();
-  }
-
-  function resetKey() {
-    localStorage.removeItem('pratima_apikey');
-    apiKey = '';
-    showKeyOverlay();
-  }
-
-  // Show 403 as key prompt so user can re-enter a wrong key
-  async function apiFetch(url, options) {
-    options = options || {};
-    const headers = authHeaders(options.headers || {});
-    const res = await fetch(url, Object.assign({}, options, { headers }));
-    if (res.status === 403) {
-      showKeyOverlay();
-      throw new Error('Invalid API key — please re-enter your key');
-    }
-    return res;
+  function authHeaders(extra, overrideKey) {
+    return Object.assign({ 'x-api-key': overrideKey || apiKey }, extra || {});
   }
 
   // ---- State ----
@@ -639,7 +576,7 @@
   let currentModalUrl = '';
   let companies     = [];
 
-  // FIX: image data stored in a Map keyed by card id — no inline JSON in HTML attributes
+  // Image data map (for modal)
   const imageDataMap = new Map();
   let   imgSeq       = 0;
 
@@ -753,7 +690,7 @@
       if (!r.ok) throw new Error(r.statusText);
       companies = await r.json();
       renderCompanies();
-      populateCompanySelector();
+      // No company selector needed for images anymore; but we still keep it for potential use
     } catch (e) {
       document.getElementById('company-list').innerHTML =
         '<div class="empty-state"><div class="empty-icon">⚠</div>' +
@@ -805,7 +742,6 @@
       input.value = '';
       loadCompanies();
       loadStats();
-      // Auto-copy the new company's API key so it's ready to share
       if (company.apiKey && navigator.clipboard) {
         navigator.clipboard.writeText(company.apiKey)
           .then(() => showToast('Company created! API key copied to clipboard'));
@@ -829,75 +765,95 @@
     }
   }
 
-  function populateCompanySelector() {
-    const sel = document.getElementById('company-selector');
-    const cur = sel.value;
-    sel.innerHTML = '<option value="">All companies</option>' +
-      companies.map(c => '<option value="' + esc(c.id) + '">' + esc(c.name) + '</option>').join('');
-    if (companies.find(c => c.id === cur)) sel.value = cur;
+  // ---- API Fetch with 403 handling (not needed now, but kept for safety) ----
+  async function apiFetch(url, options) {
+    options = options || {};
+    const headers = authHeaders(options.headers || {});
+    const res = await fetch(url, Object.assign({}, options, { headers }));
+    if (res.status === 403) {
+      alert('Access denied. The global admin key might be invalid. Reload the page or contact the administrator.');
+      throw new Error('Forbidden');
+    }
+    return res;
   }
 
-  // ---- Images ----
+  // ---- Images (grouped by company) ----
   async function loadImages() {
-    document.getElementById('images-grid').innerHTML = '<div class="loading-center"><div class="spinner"></div></div>';
+    const container = document.getElementById('images-container');
+    container.innerHTML = '<div class="loading-center"><div class="spinner"></div></div>';
     try {
-      const companyId = document.getElementById('company-selector').value;
-      let url = '/ui/api/images';
-      if (companyId) url += '?company_id=' + encodeURIComponent(companyId);
-      const r = await fetch(url);
+      const r = await fetch('/ui/api/images');
       if (!r.ok) throw new Error(r.statusText);
       allImages    = await r.json();
       imagesLoaded = true;
       renderImages(allImages);
     } catch (e) {
-      document.getElementById('images-grid').innerHTML =
+      container.innerHTML =
         '<div class="empty-state"><div class="empty-icon">⚠</div>' +
         '<div class="empty-title">Failed to load images</div><div>' + esc(e.message) + '</div></div>';
     }
   }
 
   function renderImages(imgs) {
-    const grid = document.getElementById('images-grid');
-    document.getElementById('img-count-label').textContent = imgs.length + ' image' + (imgs.length !== 1 ? 's' : '');
-
-    // FIX: clear and rebuild the imageDataMap; no JSON embedded in HTML attributes
+    const container = document.getElementById('images-container');
     imageDataMap.clear();
 
     if (imgs.length === 0) {
-      grid.innerHTML =
+      container.innerHTML =
         '<div class="empty-state"><div class="empty-icon">🖼</div>' +
         '<div class="empty-title">No images yet</div><div>Upload images via the API</div></div>';
+      document.getElementById('img-count-label').textContent = '0 images';
       return;
     }
 
-    grid.innerHTML = imgs.map(function(img) {
-      const key = 'i' + (imgSeq++);
-      imageDataMap.set(key, img);
+    // Group images by company
+    const grouped = new Map();
+    imgs.forEach(img => {
+      const key = img.company_name || 'Unknown Company';
+      if (!grouped.has(key)) grouped.set(key, []);
+      grouped.get(key).push(img);
+    });
 
-      const coLabel = img.company_name
-        ? '<div class="img-id" style="color:var(--green)">' + esc(img.company_name) + '</div>'
-        : '';
+    // Build HTML sections
+    let totalCount = 0;
+    let html = '';
+    grouped.forEach((images, companyName) => {
+      totalCount += images.length;
+      html += `<div class="images-section">
+        <div class="company-header">
+          <span>${esc(companyName)}</span>
+          <span class="img-count">${images.length} image${images.length !== 1 ? 's' : ''}</span>
+        </div>
+        <div class="images-grid">`;
+      
+      images.forEach(img => {
+        const key = 'i' + (imgSeq++);
+        imageDataMap.set(key, img);
+        html += `<div class="img-card" data-key="${key}">
+          <div class="img-thumb-wrap">
+            <img class="img-thumb" src="${esc(img.url)}" alt="" loading="lazy"
+              onerror="this.style.display='none';this.nextElementSibling.style.display='flex'" />
+            <div class="img-thumb-fail" style="display:none">🖼</div>
+          </div>
+          <div class="img-meta">
+            <div class="img-id" title="${esc(img.id)}">${esc(img.id)}</div>
+            <div class="img-row">
+              <span class="img-size">${esc(fmtBytes(img.size))}</span>
+              <span class="img-date">${esc(fmtDate(img.created))}</span>
+            </div>
+          </div>
+        </div>`;
+      });
 
-      return '<div class="img-card" data-key="' + key + '">' +
-        '<div class="img-thumb-wrap">' +
-          '<img class="img-thumb" src="' + esc(img.url) + '" alt="" loading="lazy" ' +
-            'onerror="this.style.display=\'none\';this.nextElementSibling.style.display=\'flex\'" />' +
-          '<div class="img-thumb-fail" style="display:none">🖼</div>' +
-        '</div>' +
-        '<div class="img-meta">' +
-          coLabel +
-          '<div class="img-id" title="' + esc(img.id) + '">' + esc(img.id) + '</div>' +
-          '<div class="img-row">' +
-            '<span class="img-size">' + esc(fmtBytes(img.size))    + '</span>' +
-            '<span class="img-date">' + esc(fmtDate(img.created))  + '</span>' +
-          '</div>' +
-        '</div>' +
-      '</div>';
-    }).join('');
+      html += `</div></div>`;
+    });
+
+    container.innerHTML = html;
+    document.getElementById('img-count-label').textContent = totalCount + ' image' + (totalCount !== 1 ? 's' : '');
   }
 
-  // FIX: event delegation instead of inline onclick with embedded JSON
-  document.getElementById('images-grid').addEventListener('click', function(e) {
+  // Event delegation for image cards (unchanged)
+  document.getElementById('images-container').addEventListener('click', function(e) {
     const card = e.target.closest('.img-card[data-key]');
     if (!card) return;
     const img = imageDataMap.get(card.dataset.key);
@@ -906,10 +862,12 @@
 
   function filterImages(q) {
     const lq = q.toLowerCase();
-    renderImages(q ? allImages.filter(i => i.id.toLowerCase().includes(lq)) : allImages);
+    if (!q.trim()) {
+      renderImages(allImages);
+    } else {
+      renderImages(allImages.filter(i => i.id.toLowerCase().includes(lq)));
+    }
   }
-
-  function onCompanyFilterChange() { loadImages(); }
 
   // ---- Modal ----
   function openModal(img) {
@@ -932,7 +890,6 @@
   }
 
   function closeModal() { document.getElementById('modal').classList.remove('open'); }
-
   function handleModalClick(e) {
     if (e.target === document.getElementById('modal')) closeModal();
   }
@@ -946,6 +903,41 @@
   function copyText(text) {
     if (navigator.clipboard) {
       navigator.clipboard.writeText(text).then(() => showToast('Copied!'));
+    }
+  }
+
+  // ---- Delete Image (company API key required) ----
+  async function deleteImage() {
+    if (!currentModalUrl) return;
+    const url = new URL(currentModalUrl);
+    const parts = url.pathname.split('/').filter(Boolean);
+    if (parts.length !== 3 || parts[0] !== 'img') {
+      alert('Invalid image URL');
+      return;
+    }
+    const companyId = parts[1];
+    const imageId   = parts[2];
+
+    const companyKey = prompt('Enter the company’s own API key (prtm_…) to delete this image:');
+    if (!companyKey) return;
+
+    if (!confirm('Permanently delete this image? This cannot be undone.')) return;
+
+    try {
+      const r = await fetch(`/img/${encodeURIComponent(companyId)}/${encodeURIComponent(imageId)}`, {
+        method: 'DELETE',
+        headers: { 'x-api-key': companyKey }
+      });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({ error: 'Delete failed' }));
+        throw new Error(err.error);
+      }
+      closeModal();
+      showToast('Image deleted');
+      loadImages();
+      loadStats();
+    } catch (e) {
+      alert('Delete failed: ' + e.message);
     }
   }
 
@@ -995,8 +987,6 @@
     if (logFilter !== 'all' && logFilter !== entry.level) return;
 
     const wrap = document.getElementById('logs-wrap');
-
-    // FIX: remove placeholder by its id — not by fragile div[style] selector
     const placeholder = document.getElementById('log-placeholder');
     if (placeholder) {
       placeholder.remove();
@@ -1039,7 +1029,6 @@
   // ---- Keyboard ----
   document.addEventListener('keydown', function(e) {
     if (e.key === 'Escape') closeModal();
-    if (e.key === 'Enter' && document.getElementById('key-overlay').classList.contains('open')) saveKey();
   });
 
   // ---- Init ----
@@ -1050,12 +1039,7 @@
     connectSSE();
   }
 
-  // Show key prompt if no key is stored, otherwise boot straight away
-  if (!apiKey) {
-    showKeyOverlay();
-  } else {
-    init();
-  }
+  init();
 </script>
 </body>
 </html>

@@ -14,18 +14,18 @@ import NodeClam from 'clamscan';
 import { fileURLToPath } from 'url';
 
 // ------------------- Configuration & Startup Validation -------------------
-const PORT       = process.env.PORT       || 3001;
-const HOST       = process.env.HOST       || '127.0.0.1';
-const API_KEY    = process.env.API_KEY;
+const PORT = process.env.PORT || 3001;
+const HOST = process.env.HOST || '127.0.0.1';
+const API_KEY = process.env.API_KEY;
 const ENC_KEY_HEX = process.env.ENCRYPTION_KEY || '';
 
-const CLAMD_SOCKET      = process.env.CLAMD_SOCKET      || '/var/run/clamav/clamd.ctl';
-const MAX_FILE_SIZE     = parseInt(process.env.MAX_FILE_SIZE,    10) || 10 * 1024 * 1024;
-const WEBP_QUALITY      = parseInt(process.env.WEBP_QUALITY,     10) || 92;
-const CONCURRENCY_LIMIT = parseInt(process.env.CONCURRENCY_LIMIT,10) || 2;
-const STORAGE_PATH      = process.env.STORAGE_PATH || '/var/pratima';
-const REDIS_URL         = process.env.REDIS_URL    || 'redis://127.0.0.1:6379';
-const PUBLIC_URL        = (process.env.PUBLIC_URL  || `http://localhost:${PORT}`).replace(/\/$/, '');
+const CLAMD_SOCKET = process.env.CLAMD_SOCKET || '/var/run/clamav/clamd.ctl';
+const MAX_FILE_SIZE = parseInt(process.env.MAX_FILE_SIZE, 10) || 10 * 1024 * 1024;
+const WEBP_QUALITY = parseInt(process.env.WEBP_QUALITY, 10) || 92;
+const CONCURRENCY_LIMIT = parseInt(process.env.CONCURRENCY_LIMIT, 10) || 2;
+const STORAGE_PATH = process.env.STORAGE_PATH || '/var/pratima';
+const REDIS_URL = process.env.REDIS_URL || 'redis://127.0.0.1:6379';
+const PUBLIC_URL = (process.env.PUBLIC_URL || `http://localhost:${PORT}`).replace(/\/$/, '');
 
 // Fail fast on missing / bad configuration
 const PLACEHOLDER_KEY = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
@@ -47,28 +47,28 @@ if (ENC_KEY_HEX === PLACEHOLDER_KEY) {
 }
 
 const ENCRYPTION_KEY = Buffer.from(ENC_KEY_HEX, 'hex');
-const __dirname      = path.dirname(fileURLToPath(import.meta.url));
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // ------------------- Log Capture -------------------
-const logBuffer  = [];
+const logBuffer = [];
 const sseClients = new Set();
 
 function emitLog(level, ...args) {
   const message = args
     .map(a => a instanceof Error ? (a.stack || a.message) : typeof a === 'object' ? JSON.stringify(a) : String(a))
     .join(' ');
-  const entry   = { time: new Date().toISOString(), level, message };
+  const entry = { time: new Date().toISOString(), level, message };
   logBuffer.push(entry);
   if (logBuffer.length > 500) logBuffer.shift();
   const payload = `data: ${JSON.stringify(entry)}\n\n`;
   for (const client of sseClients) client.write(payload);
 }
 
-const _log   = console.log.bind(console);
-const _warn  = console.warn.bind(console);
+const _log = console.log.bind(console);
+const _warn = console.warn.bind(console);
 const _error = console.error.bind(console);
-console.log   = (...a) => { _log(...a);   emitLog('info',  ...a); };
-console.warn  = (...a) => { _warn(...a);  emitLog('warn',  ...a); };
+console.log = (...a) => { _log(...a); emitLog('info', ...a); };
+console.warn = (...a) => { _warn(...a); emitLog('warn', ...a); };
 console.error = (...a) => { _error(...a); emitLog('error', ...a); };
 
 // ------------------- Storage & Companies -------------------
@@ -79,11 +79,11 @@ const COMPANIES_FILE = path.join(STORAGE_PATH, 'companies.json');
 let companiesLock = Promise.resolve();
 async function withCompaniesLock(fn) {
   let resolveLock;
-  const newLock  = new Promise(r => (resolveLock = r));
+  const newLock = new Promise(r => (resolveLock = r));
   const prevLock = companiesLock;
-  companiesLock  = newLock;
+  companiesLock = newLock;
   await prevLock;
-  try   { return await fn(); }
+  try { return await fn(); }
   finally { resolveLock(); }
 }
 
@@ -116,20 +116,20 @@ function makeRedis(url) {
   });
 }
 
-const redis    = makeRedis(REDIS_URL);
+const redis = makeRedis(REDIS_URL);
 const redisSub = makeRedis(REDIS_URL);
 
 let redisReady = false;
-redis.on('ready', () => { redisReady = true;  console.log('Redis connected'); });
+redis.on('ready', () => { redisReady = true; console.log('Redis connected'); });
 redis.on('close', () => { redisReady = false; console.warn('Redis connection closed — reconnecting…'); });
 // Log errors but do NOT exit — ioredis will reconnect automatically
-redis.on('error',    err => console.error('Redis error:',    err.message));
+redis.on('error', err => console.error('Redis error:', err.message));
 redisSub.on('error', err => console.error('RedisSub error:', err.message));
 
 // ------------------- Distributed semaphore -------------------
 const NOTIFY_CHANNEL = 'semaphore:notify';
-const ACTIVE_KEY     = 'semaphore:active';
-const WAIT_KEY       = 'semaphore:wait';
+const ACTIVE_KEY = 'semaphore:active';
+const WAIT_KEY = 'semaphore:wait';
 
 // Reset stale counter from any previous unclean shutdown
 await redis.set(ACTIVE_KEY, 0);
@@ -179,7 +179,7 @@ redisSub.on('message', (channel, message) => {
 });
 
 async function acquireSlot() {
-  const id     = uuidv4();
+  const id = uuidv4();
   const result = await redis.acquireSemaphore(ACTIVE_KEY, WAIT_KEY, CONCURRENCY_LIMIT, id);
   if (result === 'ACQUIRED') return;
 
@@ -197,21 +197,21 @@ async function releaseSlot() {
 }
 
 // ------------------- Encryption -------------------
-const ALGORITHM       = 'aes-256-gcm';
-const IV_LENGTH       = 12;
+const ALGORITHM = 'aes-256-gcm';
+const IV_LENGTH = 12;
 const AUTH_TAG_LENGTH = 16;
 
 function encryptBuffer(buf) {
-  const iv     = crypto.randomBytes(IV_LENGTH);
+  const iv = crypto.randomBytes(IV_LENGTH);
   const cipher = crypto.createCipheriv(ALGORITHM, ENCRYPTION_KEY, iv);
-  const body   = Buffer.concat([cipher.update(buf), cipher.final()]);
+  const body = Buffer.concat([cipher.update(buf), cipher.final()]);
   return Buffer.concat([iv, cipher.getAuthTag(), body]);
 }
 
 function decryptBuffer(buf) {
-  const iv       = buf.subarray(0, IV_LENGTH);
-  const tag      = buf.subarray(IV_LENGTH, IV_LENGTH + AUTH_TAG_LENGTH);
-  const data     = buf.subarray(IV_LENGTH + AUTH_TAG_LENGTH);
+  const iv = buf.subarray(0, IV_LENGTH);
+  const tag = buf.subarray(IV_LENGTH, IV_LENGTH + AUTH_TAG_LENGTH);
+  const data = buf.subarray(IV_LENGTH + AUTH_TAG_LENGTH);
   const decipher = crypto.createDecipheriv(ALGORITHM, ENCRYPTION_KEY, iv);
   decipher.setAuthTag(tag);
   return Buffer.concat([decipher.update(data), decipher.final()]);
@@ -225,7 +225,7 @@ function generateCompanyKey() {
 // ------------------- Validation helpers -------------------
 // FIX: strict regex prevents path-traversal in image_id
 const COMPANY_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const IMAGE_ID_RE     = /^pratima_[a-z0-9_]+$/;
+const IMAGE_ID_RE = /^pratima_[a-z0-9_]+$/;
 
 function sanitizeName(str, len) {
   const clean = str.toLowerCase().replace(/[^a-z0-9]/g, '').substring(0, len);
@@ -243,10 +243,10 @@ app.set('trust proxy', 1); // honour X-Forwarded-For behind nginx
 // CORS — must come before every other middleware so preflight OPTIONS requests
 // are answered before rate-limiting or auth runs
 app.use((req, res, next) => {
-  res.set('Access-Control-Allow-Origin',  '*');
+  res.set('Access-Control-Allow-Origin', '*');
   res.set('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
   res.set('Access-Control-Allow-Headers', 'x-api-key, Content-Type');
-  res.set('Access-Control-Max-Age',       '86400'); // cache preflight for 24 h
+  res.set('Access-Control-Max-Age', '86400'); // cache preflight for 24 h
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
@@ -314,7 +314,7 @@ app.delete('/companies/:id', verifyApiKey, mgmtLimiter, async (req, res) => {
   let removed = null;
   const found = await withCompaniesLock(async () => {
     const list = await loadCompanies();
-    const idx  = list.findIndex(c => c.id === id);
+    const idx = list.findIndex(c => c.id === id);
     if (idx === -1) return false;
     [removed] = list.splice(idx, 1);
     await saveCompanies(list);
@@ -336,7 +336,7 @@ const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: MAX_FILE_SIZE },
   fileFilter: (_req, file, cb) => {
-    const ok = ['image/jpeg','image/png','image/webp','image/gif','image/tiff'].includes(file.mimetype);
+    const ok = ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/tiff'].includes(file.mimetype);
     cb(null, ok);
   },
 });
@@ -345,11 +345,11 @@ app.post('/upload', uploadLimiter, upload.single('image'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No valid image file provided (accepted: JPEG, PNG, WebP, GIF, TIFF)' });
 
   const companyId = req.body.company_id || req.query.company_id;
-  if (!companyId)                       return res.status(400).json({ error: 'company_id is required' });
+  if (!companyId) return res.status(400).json({ error: 'company_id is required' });
   if (!COMPANY_UUID_RE.test(companyId)) return res.status(400).json({ error: 'Invalid company_id format' });
 
   const companies = await loadCompanies();
-  const company   = companies.find(c => c.id === companyId);
+  const company = companies.find(c => c.id === companyId);
   if (!company) return res.status(404).json({ error: 'Company not found' });
 
   // Each company authenticates with its own key — not the global admin key
@@ -359,8 +359,8 @@ app.post('/upload', uploadLimiter, upload.single('image'), async (req, res) => {
 
   await acquireSlot();
   try {
-    const buf      = req.file.buffer;
-    const meta     = await sharp(buf).metadata();
+    const buf = req.file.buffer;
+    const meta = await sharp(buf).metadata();
     if (!meta.format) throw new Error('Unrecognised image format');
 
     if (clamscan) {
@@ -370,20 +370,20 @@ app.post('/upload', uploadLimiter, upload.single('image'), async (req, res) => {
 
     // FIX: removed .withMetadata(false) — sharp strips metadata by default without this call.
     // Calling .withMetadata(false) passes a falsy options object which may re-enable metadata.
-    const webpBuf   = await sharp(buf).webp({ quality: WEBP_QUALITY }).toBuffer();
+    const webpBuf = await sharp(buf).webp({ quality: WEBP_QUALITY }).toBuffer();
     const encrypted = encryptBuffer(webpBuf);
 
-    const coShort   = sanitizeName(company.name, 4);
-    const origName  = path.basename(req.file.originalname, path.extname(req.file.originalname));
+    const coShort = sanitizeName(company.name, 4);
+    const origName = path.basename(req.file.originalname, path.extname(req.file.originalname));
     const fileShort = sanitizeName(origName, 4);
-    let imageId     = `pratima_${coShort}_${fileShort}`;
+    let imageId = `pratima_${coShort}_${fileShort}`;
 
     const companyDir = path.join(STORAGE_PATH, 'companies', companyId);
     await fs.mkdir(companyDir, { recursive: true });
 
     let targetPath = path.join(companyDir, imageId);
     while (await fileExists(targetPath)) {
-      imageId    = `pratima_${coShort}_${fileShort}_${crypto.randomBytes(2).toString('hex')}`;
+      imageId = `pratima_${coShort}_${fileShort}_${crypto.randomBytes(2).toString('hex')}`;
       targetPath = path.join(companyDir, imageId);
     }
 
@@ -405,13 +405,13 @@ app.get('/img/:company_id/:image_id', async (req, res) => {
 
   // FIX: strict regex on image_id prevents path-traversal attacks
   if (!COMPANY_UUID_RE.test(company_id)) return res.status(400).send('Invalid company ID');
-  if (!IMAGE_ID_RE.test(image_id))       return res.status(400).send('Invalid image ID');
+  if (!IMAGE_ID_RE.test(image_id)) return res.status(400).send('Invalid image ID');
 
   try {
     const encrypted = await fs.readFile(path.join(STORAGE_PATH, 'companies', company_id, image_id));
     const decrypted = decryptBuffer(encrypted);
-    res.set('Content-Type',              'image/webp');
-    res.set('Cache-Control',             'public, max-age=31536000, immutable');
+    res.set('Content-Type', 'image/webp');
+    res.set('Cache-Control', 'public, max-age=31536000, immutable');
     res.set('Access-Control-Allow-Origin', '*'); // allow embedding in other domains
     res.send(decrypted);
   } catch {
@@ -419,11 +419,44 @@ app.get('/img/:company_id/:image_id', async (req, res) => {
   }
 });
 
+// ------------------- Image Deletion -------------------
+app.delete('/img/:company_id/:image_id', async (req, res) => {
+  const { company_id, image_id } = req.params;
+
+  if (!COMPANY_UUID_RE.test(company_id)) return res.status(400).json({ error: 'Invalid company ID' });
+  if (!IMAGE_ID_RE.test(image_id)) return res.status(400).json({ error: 'Invalid image ID' });
+
+  const companies = await loadCompanies();
+  const company = companies.find(c => c.id === company_id);
+  if (!company) return res.status(404).json({ error: 'Company not found' });
+
+  // Each company uses its own API key (the prtm_... key)
+  if (req.headers['x-api-key'] !== company.apiKey) {
+    return res.status(403).json({ error: 'Invalid API key' });
+  }
+
+  const filePath = path.join(STORAGE_PATH, 'companies', company_id, image_id);
+  try {
+    await fs.unlink(filePath);
+    console.log(`Deleted ${image_id} for ${company.name} (${company_id})`);
+    return res.json({ success: true });
+  } catch (err) {
+    if (err.code === 'ENOENT') return res.status(404).json({ error: 'Image not found' });
+    console.error('Delete error:', err);
+    return res.status(500).json({ error: 'Failed to delete image' });
+  }
+});
+
 // ------------------- UI -------------------
+// ------------------- UI (with injected global API key) -------------------
 app.get('/ui', async (_req, res) => {
   try {
+    let html = await fs.readFile(path.join(__dirname, 'ui.html'), 'utf-8');
+    // Inject the global API_KEY into a <script> variable (never hard‑coded in the HTML)
+    const injectedKey = JSON.stringify(API_KEY);   // safe for JavaScript strings
+    html = html.replace('<!-- PRATIMA_API_KEY -->', `<script>window.PRATIMA_GLOBAL_API_KEY = ${injectedKey};</script>`);
     res.set('Content-Type', 'text/html; charset=utf-8');
-    res.send(await fs.readFile(path.join(__dirname, 'ui.html')));
+    res.send(html);
   } catch (err) {
     res.status(500).send('UI not available: ' + err.message);
   }
@@ -436,21 +469,21 @@ app.get('/ui/api/stats', async (_req, res) => {
     await redis.ping();
     redisStatus = 'connected';
     activeSlots = Math.max(0, parseInt(await redis.get(ACTIVE_KEY) || '0', 10));
-  } catch (_) {}
+  } catch (_) { }
 
-  const companies  = await loadCompanies();
-  let totalImages  = 0;
+  const companies = await loadCompanies();
+  let totalImages = 0;
   let storageBytes = 0;
   for (const co of companies) {
     const dir = path.join(STORAGE_PATH, 'companies', co.id);
     try {
       const files = (await fs.readdir(dir)).filter(f => f.startsWith('pratima_'));
       totalImages += files.length;
-      const sizes  = await Promise.all(
+      const sizes = await Promise.all(
         files.map(f => fs.stat(path.join(dir, f)).then(s => s.size).catch(() => 0))
       );
       storageBytes += sizes.reduce((a, b) => a + b, 0);
-    } catch (_) {}
+    } catch (_) { }
   }
 
   res.json({
@@ -474,9 +507,9 @@ app.get('/ui/api/stats', async (_req, res) => {
 });
 
 app.get('/ui/api/images', async (req, res) => {
-  const filter    = req.query.company_id;
+  const filter = req.query.company_id;
   const companies = await loadCompanies();
-  const images    = [];
+  const images = [];
 
   for (const co of companies) {
     if (filter && co.id !== filter) continue;
@@ -486,16 +519,16 @@ app.get('/ui/api/images', async (req, res) => {
       const stats = await Promise.all(files.map(async f => {
         const s = await fs.stat(path.join(dir, f));
         return {
-          id:           f,
-          url:          `${PUBLIC_URL}/img/${co.id}/${f}`,
-          size:         s.size,
-          created:      s.birthtime || s.mtime,
-          company_id:   co.id,
+          id: f,
+          url: `${PUBLIC_URL}/img/${co.id}/${f}`,
+          size: s.size,
+          created: s.birthtime || s.mtime,
+          company_id: co.id,
           company_name: co.name,
         };
       }));
       images.push(...stats);
-    } catch (_) {}
+    } catch (_) { }
   }
 
   images.sort((a, b) => new Date(b.created) - new Date(a.created));
@@ -505,9 +538,9 @@ app.get('/ui/api/images', async (req, res) => {
 // SSE log stream — sends buffered history then streams live entries
 app.get('/ui/api/logs', (req, res) => {
   res.set({
-    'Content-Type':      'text/event-stream',
-    'Cache-Control':     'no-cache',
-    'Connection':        'keep-alive',
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
     'X-Accel-Buffering': 'no',
   });
   res.flushHeaders();
@@ -537,11 +570,11 @@ const server = app.listen(PORT, HOST, () => {
 async function shutdown(signal) {
   console.log(`${signal} received — shutting down gracefully`);
   server.close(async () => {
-    try { await redis.quit(); await redisSub.quit(); } catch (_) {}
+    try { await redis.quit(); await redisSub.quit(); } catch (_) { }
     process.exit(0);
   });
   setTimeout(() => process.exit(1), 10_000); // force-kill after 10 s
 }
 
 process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('SIGINT',  () => shutdown('SIGINT'));
+process.on('SIGINT', () => shutdown('SIGINT'));
