@@ -225,15 +225,13 @@ function generateCompanyKey() {
 // ------------------- Validation helpers -------------------
 // FIX: strict regex prevents path-traversal in image_id
 const COMPANY_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const IMAGE_ID_RE = /^pratima_[a-z0-9_]+$/;
+// Legacy keys (company+filename derived) stay resolvable; new uploads use a UUID storage key.
+const LEGACY_IMAGE_ID_RE = /^pratima_[a-z0-9_]+$/;
+const UUID_IMAGE_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.webp$/i;
+const IMAGE_ID_RE = new RegExp(`(?:${LEGACY_IMAGE_ID_RE.source})|(?:${UUID_IMAGE_ID_RE.source})`, 'i');
 
-function sanitizeName(str, len) {
-  const clean = str.toLowerCase().replace(/[^a-z0-9]/g, '').substring(0, len);
-  return clean.padEnd(len, '0');   // '0' pad instead of 'x' — clearer intent
-}
-
-async function fileExists(p) {
-  try { await fs.access(p); return true; } catch { return false; }
+function isImageFile(filename) {
+  return LEGACY_IMAGE_ID_RE.test(filename) || UUID_IMAGE_ID_RE.test(filename);
 }
 
 // ------------------- Express setup -------------------
@@ -373,21 +371,35 @@ app.post('/upload', uploadLimiter, upload.single('image'), async (req, res) => {
     const webpBuf = await sharp(buf).webp({ quality: WEBP_QUALITY }).toBuffer();
     const encrypted = encryptBuffer(webpBuf);
 
-    const coShort = sanitizeName(company.name, 4);
-    const origName = path.basename(req.file.originalname, path.extname(req.file.originalname));
-    const fileShort = sanitizeName(origName, 4);
-    let imageId = `pratima_${coShort}_${fileShort}`;
-
     const companyDir = path.join(STORAGE_PATH, 'companies', companyId);
     await fs.mkdir(companyDir, { recursive: true });
 
-    let targetPath = path.join(companyDir, imageId);
-    while (await fileExists(targetPath)) {
-      imageId = `pratima_${coShort}_${fileShort}_${crypto.randomBytes(2).toString('hex')}`;
+    // Storage key is a server-generated UUID — never derived from the client filename,
+    // so two uploads can never collide on path even with identical original names.
+    let imageId, targetPath;
+    const MAX_ID_ATTEMPTS = 5;
+    for (let attempt = 1; ; attempt++) {
+      imageId = `${uuidv4()}.webp`;
       targetPath = path.join(companyDir, imageId);
+      try {
+        // 'wx' fails loudly (EEXIST) instead of silently overwriting on a collision.
+        await fs.writeFile(targetPath, encrypted, { flag: 'wx', mode: 0o600 });
+        break;
+      } catch (err) {
+        if (err.code === 'EEXIST' && attempt < MAX_ID_ATTEMPTS) continue;
+        if (err.code === 'EEXIST') throw new Error('Could not allocate a unique storage key — please retry upload');
+        throw err;
+      }
     }
 
-    await fs.writeFile(targetPath, encrypted, { mode: 0o600 });
+    // Original filename is kept only as metadata (e.g. Content-Disposition on download),
+    // never as part of the storage key/path.
+    const metaPath = path.join(companyDir, `${imageId}.json`);
+    await fs.writeFile(metaPath, JSON.stringify({
+      originalName: req.file.originalname,
+      uploadedAt: new Date().toISOString(),
+    }), { mode: 0o600 });
+
     console.log(`Stored ${imageId} for ${company.name} (${(webpBuf.length / 1024).toFixed(1)} KB WebP)`);
 
     res.json({ url: `${PUBLIC_URL}/img/${companyId}/${imageId}`, imageId, companyId });
@@ -408,11 +420,23 @@ app.get('/img/:company_id/:image_id', async (req, res) => {
   if (!IMAGE_ID_RE.test(image_id)) return res.status(400).send('Invalid image ID');
 
   try {
-    const encrypted = await fs.readFile(path.join(STORAGE_PATH, 'companies', company_id, image_id));
+    const companyDir = path.join(STORAGE_PATH, 'companies', company_id);
+    const encrypted = await fs.readFile(path.join(companyDir, image_id));
     const decrypted = decryptBuffer(encrypted);
     res.set('Content-Type', 'image/webp');
     res.set('Cache-Control', 'public, max-age=31536000, immutable');
     res.set('Access-Control-Allow-Origin', '*'); // allow embedding in other domains
+
+    // Original filename (if we have it) surfaces only in Content-Disposition, never in the path.
+    if (UUID_IMAGE_ID_RE.test(image_id)) {
+      try {
+        const sidecar = JSON.parse(await fs.readFile(path.join(companyDir, `${image_id}.json`), 'utf-8'));
+        if (sidecar.originalName) {
+          res.set('Content-Disposition', `inline; filename="${encodeURIComponent(sidecar.originalName)}"`);
+        }
+      } catch { /* no metadata sidecar — serve without Content-Disposition */ }
+    }
+
     res.send(decrypted);
   } catch {
     res.status(404).send('Not found');
@@ -435,9 +459,13 @@ app.delete('/img/:company_id/:image_id', async (req, res) => {
     return res.status(403).json({ error: 'Invalid API key' });
   }
 
-  const filePath = path.join(STORAGE_PATH, 'companies', company_id, image_id);
+  const companyDir = path.join(STORAGE_PATH, 'companies', company_id);
+  const filePath = path.join(companyDir, image_id);
   try {
     await fs.unlink(filePath);
+    if (UUID_IMAGE_ID_RE.test(image_id)) {
+      await fs.unlink(path.join(companyDir, `${image_id}.json`)).catch(() => {});
+    }
     console.log(`Deleted ${image_id} for ${company.name} (${company_id})`);
     return res.json({ success: true });
   } catch (err) {
@@ -448,7 +476,6 @@ app.delete('/img/:company_id/:image_id', async (req, res) => {
 });
 
 // ------------------- UI -------------------
-// ------------------- UI (with injected global API key) -------------------
 app.get('/ui', async (_req, res) => {
   try {
     let html = await fs.readFile(path.join(__dirname, 'ui.html'), 'utf-8');
@@ -477,7 +504,7 @@ app.get('/ui/api/stats', async (_req, res) => {
   for (const co of companies) {
     const dir = path.join(STORAGE_PATH, 'companies', co.id);
     try {
-      const files = (await fs.readdir(dir)).filter(f => f.startsWith('pratima_'));
+      const files = (await fs.readdir(dir)).filter(isImageFile);
       totalImages += files.length;
       const sizes = await Promise.all(
         files.map(f => fs.stat(path.join(dir, f)).then(s => s.size).catch(() => 0))
@@ -515,7 +542,7 @@ app.get('/ui/api/images', async (req, res) => {
     if (filter && co.id !== filter) continue;
     const dir = path.join(STORAGE_PATH, 'companies', co.id);
     try {
-      const files = (await fs.readdir(dir)).filter(f => f.startsWith('pratima_'));
+      const files = (await fs.readdir(dir)).filter(isImageFile);
       const stats = await Promise.all(files.map(async f => {
         const s = await fs.stat(path.join(dir, f));
         return {
