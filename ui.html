@@ -446,6 +446,7 @@
       <div class="stat-card"><div class="stat-label">Uptime</div><div class="stat-value" id="s-uptime">—</div><div class="stat-sub">since last restart</div></div>
       <div class="stat-card"><div class="stat-label">Redis</div><div class="stat-value" id="s-redis">—</div><div class="stat-sub">distributed semaphore</div></div>
       <div class="stat-card"><div class="stat-label">ClamAV</div><div class="stat-value" id="s-clamav">—</div><div class="stat-sub">malware scanning</div></div>
+      <div class="stat-card"><div class="stat-label">Ghostscript</div><div class="stat-value" id="s-ghostscript">—</div><div class="stat-sub">PDF compression</div></div>
       <div class="stat-card"><div class="stat-label">Active Uploads</div><div class="stat-value" id="s-slots">—</div><div class="stat-sub">of <span id="s-limit">—</span> max concurrent</div></div>
     </div>
 
@@ -460,10 +461,12 @@
       <div class="section-header"><span class="section-title">API Endpoints</span></div>
       <div class="data-table">
         <div class="data-row"><span class="data-key">Health Check</span><span class="data-val">GET /health</span></div>
-        <div class="data-row"><span class="data-key">Upload Image</span><span class="data-val">POST /upload · x-api-key header · multipart/form-data · company_id required</span></div>
-        <div class="data-row"><span class="data-key">Retrieve Image</span><span class="data-val">GET /img/:company_id/:image_id</span></div>
-        <div class="data-row"><span class="data-key">Delete Image</span><span class="data-val">DELETE /img/:company_id/:image_id · company’s own API key</span></div>
+        <div class="data-row"><span class="data-key">Upload Image/PDF</span><span class="data-val">POST /upload · x-api-key header · multipart/form-data · company_id required</span></div>
+        <div class="data-row"><span class="data-key">Retrieve File</span><span class="data-val">GET /img/:company_id/:image_id</span></div>
+        <div class="data-row"><span class="data-key">Delete File</span><span class="data-val">DELETE /img/:company_id/:image_id · company’s own API key</span></div>
         <div class="data-row"><span class="data-key">Companies</span><span class="data-val">GET /companies · POST /companies · DELETE /companies/:id · all require x-api-key</span></div>
+        <div class="data-row"><span class="data-key">Domain Restriction</span><span class="data-val">PUT /companies/:id/domains {domains:[…]} · x-api-key</span></div>
+        <div class="data-row"><span class="data-key">Backup / Restore</span><span class="data-val">GET /companies/:id/backup · POST /companies/:id/restore · x-api-key</span></div>
         <div class="data-row"><span class="data-key">Dashboard UI</span><span class="data-val">GET /ui</span></div>
         <div class="data-row"><span class="data-key">Stats API</span><span class="data-val">GET /ui/api/stats</span></div>
         <div class="data-row"><span class="data-key">Images API</span><span class="data-val">GET /ui/api/images?company_id=…</span></div>
@@ -476,11 +479,13 @@
       <div class="data-table">
         <div class="data-row"><span class="data-key">Encryption</span><span class="data-val">AES-256-GCM · per-file random IV · 16-byte auth tag</span></div>
         <div class="data-row"><span class="data-key">Auth</span><span class="data-val">x-api-key header (upload, company management, /companies GET)</span></div>
-        <div class="data-row"><span class="data-key">Accepted formats</span><span class="data-val">JPEG · PNG · WebP · GIF · TIFF</span></div>
-        <div class="data-row"><span class="data-key">Output format</span><span class="data-val">WebP (original dimensions, EXIF/metadata stripped)</span></div>
+        <div class="data-row"><span class="data-key">Accepted formats</span><span class="data-val">JPEG · PNG · WebP · GIF · TIFF · PDF</span></div>
+        <div class="data-row"><span class="data-key">Output format</span><span class="data-val">Images → WebP (EXIF/metadata stripped) · PDFs → Ghostscript-compressed (stored as-is if Ghostscript unavailable)</span></div>
+        <div class="data-row"><span class="data-key">Storage key</span><span class="data-val">Server-generated UUID v4 — never the client filename; original name kept only as Content-Disposition metadata</span></div>
         <div class="data-row"><span class="data-key">File permissions</span><span class="data-val">0o600 (owner read/write only)</span></div>
         <div class="data-row"><span class="data-key">Malware scan</span><span class="data-val" id="sec-clamav">—</span></div>
-        <div class="data-row"><span class="data-key">Path traversal</span><span class="data-val">Strict regex on image_id — only [a-z0-9_] chars permitted</span></div>
+        <div class="data-row"><span class="data-key">Domain restriction</span><span class="data-val">Optional per-company Referer/Origin allow-list — set from the Companies tab</span></div>
+        <div class="data-row"><span class="data-key">Path traversal</span><span class="data-val">Strict regex on image_id — legacy [a-z0-9_] keys or UUID.(webp|pdf)</span></div>
         <div class="data-row"><span class="data-key">Rate limiting</span><span class="data-val">30 uploads/min · 20 management calls/min · 300 global/min</span></div>
       </div>
     </div>
@@ -558,6 +563,7 @@
 </div>
 
 <div class="copied-toast" id="toast">Copied to clipboard</div>
+<input type="file" id="restore-file-input" accept=".zip" style="display:none" onchange="handleRestoreFileChosen(event)" />
 
 <script>
   // ---- Global admin key injected by server (no manual entry) ----
@@ -658,6 +664,7 @@
       document.getElementById('header-uptime').textContent   = 'up ' + fmtUptime(d.uptime);
       document.getElementById('s-redis').innerHTML           = badge(d.redisStatus);
       document.getElementById('s-clamav').innerHTML          = badge(d.clamavStatus);
+      document.getElementById('s-ghostscript').innerHTML     = badge(d.ghostscriptStatus);
       document.getElementById('sec-clamav').textContent      =
         d.clamavStatus === 'connected' ? 'ClamAV daemon active' : 'ClamAV unavailable (uploads proceed)';
       document.getElementById('s-slots').textContent  = d.activeSlots;
@@ -714,6 +721,12 @@
           '<button class="btn btn-sm" data-copy="' + esc(c.apiKey) + '" onclick="copyText(this.dataset.copy)" style="margin-left:6px;">Copy Key</button>'
         : '<span style="color:var(--muted)">—</span>';
 
+      const domainsList = Array.isArray(c.allowedDomains) ? c.allowedDomains : [];
+      const domainsHtml = domainsList.length
+        ? domainsList.map(d => '<span class="badge badge-blue" style="margin-right:4px;">' + esc(d) + '</span>').join('')
+        : '<span style="color:var(--muted);">Unrestricted (any domain)</span>';
+      const domainsJson = esc(JSON.stringify(domainsList));
+
       return '<div class="company-card">' +
         '<div class="company-info">' +
           '<div class="company-name">' + esc(c.name) + '</div>' +
@@ -721,10 +734,96 @@
           '<div class="company-meta" style="margin-top:6px;display:flex;align-items:center;flex-wrap:wrap;gap:4px;">' +
             '<span style="color:var(--muted);margin-right:4px;">API Key:</span>' + keyHtml +
           '</div>' +
+          '<div class="company-meta" style="margin-top:6px;display:flex;align-items:center;flex-wrap:wrap;gap:4px;">' +
+            '<span style="color:var(--muted);margin-right:4px;">Allowed domains:</span>' + domainsHtml +
+          '</div>' +
         '</div>' +
-        '<button class="btn btn-danger btn-sm" style="flex-shrink:0;" onclick="deleteCompany(\'' + esc(c.id) + '\',\'' + esc(c.name) + '\')">Delete</button>' +
+        '<div style="display:flex;gap:6px;flex-shrink:0;flex-wrap:wrap;justify-content:flex-end;max-width:220px;">' +
+          '<button class="btn btn-sm" data-domains="' + domainsJson + '" onclick="editDomains(\'' + esc(c.id) + '\',\'' + esc(c.name) + '\',this.dataset.domains)">Domains</button>' +
+          '<button class="btn btn-sm" onclick="downloadBackup(\'' + esc(c.id) + '\',\'' + esc(c.name) + '\')">Backup</button>' +
+          '<button class="btn btn-sm" onclick="triggerRestore(\'' + esc(c.id) + '\',\'' + esc(c.name) + '\')">Restore</button>' +
+          '<button class="btn btn-danger btn-sm" onclick="deleteCompany(\'' + esc(c.id) + '\',\'' + esc(c.name) + '\')">Delete</button>' +
+        '</div>' +
       '</div>';
     }).join('');
+  }
+
+  // ---- Domain restriction ----
+  function editDomains(id, name, currentJson) {
+    let current;
+    try { current = JSON.parse(currentJson); } catch (_) { current = []; }
+    const input = prompt(
+      'Comma-separated domains allowed to access "' + name + '"\'s files.\nLeave blank to make it unrestricted (default):',
+      current.join(', ')
+    );
+    if (input === null) return; // cancelled
+    const domains = input.split(',').map(s => s.trim()).filter(Boolean);
+    updateDomains(id, domains);
+  }
+
+  async function updateDomains(id, domains) {
+    try {
+      const r = await apiFetch('/companies/' + encodeURIComponent(id) + '/domains', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ domains }),
+      });
+      if (!r.ok) throw new Error((await r.json()).error);
+      showToast(domains.length ? 'Domain restriction updated' : 'Restriction removed — unrestricted');
+      loadCompanies();
+    } catch (e) {
+      alert('Failed to update domains: ' + e.message);
+    }
+  }
+
+  // ---- Backup / Restore (single company) ----
+  async function downloadBackup(id, name) {
+    try {
+      const r = await apiFetch('/companies/' + encodeURIComponent(id) + '/backup');
+      if (!r.ok) throw new Error((await r.json().catch(() => ({ error: r.statusText }))).error);
+      const blob = await r.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'pratima-backup-' + name.replace(/[^a-z0-9_-]+/gi, '_') + '-' + id + '.zip';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      showToast('Backup downloaded');
+    } catch (e) {
+      alert('Backup failed: ' + e.message);
+    }
+  }
+
+  let pendingRestoreCompany = null;
+
+  function triggerRestore(id, name) {
+    pendingRestoreCompany = { id: id, name: name };
+    document.getElementById('restore-file-input').click();
+  }
+
+  async function handleRestoreFileChosen(e) {
+    const file = e.target.files[0];
+    e.target.value = ''; // allow re-selecting the same file next time
+    if (!file || !pendingRestoreCompany) return;
+    const id = pendingRestoreCompany.id, name = pendingRestoreCompany.name;
+    pendingRestoreCompany = null;
+
+    if (!confirm('Restore files into "' + name + '" from ' + file.name + '? This overwrites any files with matching IDs.')) return;
+
+    try {
+      const form = new FormData();
+      form.append('backup', file);
+      const r = await apiFetch('/companies/' + encodeURIComponent(id) + '/restore', { method: 'POST', body: form });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error);
+      showToast('Restored ' + data.restored + ' file(s)' + (data.skipped ? ', skipped ' + data.skipped : ''));
+      loadImages();
+      loadStats();
+    } catch (e) {
+      alert('Restore failed: ' + e.message);
+    }
   }
 
   async function createCompany() {
@@ -829,12 +928,13 @@
       images.forEach(img => {
         const key = 'i' + (imgSeq++);
         imageDataMap.set(key, img);
-        html += `<div class="img-card" data-key="${key}">
-          <div class="img-thumb-wrap">
-            <img class="img-thumb" src="${esc(img.url)}" alt="" loading="lazy"
+        const thumbHtml = img.type === 'pdf'
+          ? '<div class="img-thumb-fail" style="display:flex;">📄</div>'
+          : `<img class="img-thumb" src="${esc(img.url)}" alt="" loading="lazy"
               onerror="this.style.display='none';this.nextElementSibling.style.display='flex'" />
-            <div class="img-thumb-fail" style="display:none">🖼</div>
-          </div>
+            <div class="img-thumb-fail" style="display:none">🖼</div>`;
+        html += `<div class="img-card" data-key="${key}">
+          <div class="img-thumb-wrap">${thumbHtml}</div>
           <div class="img-meta">
             <div class="img-id" title="${esc(img.id)}">${esc(img.id)}</div>
             <div class="img-row">
@@ -872,7 +972,9 @@
   // ---- Modal ----
   function openModal(img) {
     currentModalUrl = img.url;
-    document.getElementById('modal-img').src     = img.url;
+    const isPdf = img.type === 'pdf';
+    document.getElementById('modal-img').src     = isPdf ? '' : img.url;
+    document.getElementById('modal-img').style.display = isPdf ? 'none' : 'block';
     document.getElementById('modal-link').href   = img.url;
     const meta = [
       ['Image ID',       img.id],
@@ -880,7 +982,7 @@
       ['Public URL',     img.url],
       ['Encrypted size', fmtBytes(img.size)],
       ['Uploaded',       fmtDate(img.created)],
-      ['Format',         'WebP (AES-256-GCM encrypted at rest)'],
+      ['Format',         isPdf ? 'PDF (AES-256-GCM encrypted at rest)' : 'WebP (AES-256-GCM encrypted at rest)'],
     ];
     document.getElementById('modal-meta').innerHTML = meta.map(function(row) {
       return '<div class="data-row"><span class="data-key">' + esc(row[0]) +

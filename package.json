@@ -8,6 +8,7 @@
     "dev": "node --watch pratima.js"
   },
   "dependencies": {
+    "adm-zip": "^0.5.16",
     "clamscan": "^2.4.0",
     "dotenv": "^16.4.5",
     "express": "^4.21.0",

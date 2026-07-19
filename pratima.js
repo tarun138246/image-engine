@@ -11,7 +11,13 @@ import path from 'path';
 import { Readable } from 'stream';
 import Redis from 'ioredis';
 import NodeClam from 'clamscan';
+import AdmZip from 'adm-zip';
 import { fileURLToPath } from 'url';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
+import os from 'os';
+
+const execFileAsync = promisify(execFile);
 
 // ------------------- Configuration & Startup Validation -------------------
 const PORT = process.env.PORT || 3001;
@@ -21,11 +27,13 @@ const ENC_KEY_HEX = process.env.ENCRYPTION_KEY || '';
 
 const CLAMD_SOCKET = process.env.CLAMD_SOCKET || '/var/run/clamav/clamd.ctl';
 const MAX_FILE_SIZE = parseInt(process.env.MAX_FILE_SIZE, 10) || 10 * 1024 * 1024;
+const MAX_BACKUP_SIZE = parseInt(process.env.MAX_BACKUP_SIZE, 10) || 200 * 1024 * 1024;
 const WEBP_QUALITY = parseInt(process.env.WEBP_QUALITY, 10) || 92;
 const CONCURRENCY_LIMIT = parseInt(process.env.CONCURRENCY_LIMIT, 10) || 2;
 const STORAGE_PATH = process.env.STORAGE_PATH || '/var/pratima';
 const REDIS_URL = process.env.REDIS_URL || 'redis://127.0.0.1:6379';
 const PUBLIC_URL = (process.env.PUBLIC_URL || `http://localhost:${PORT}`).replace(/\/$/, '');
+const GS_BINARY = process.env.GS_BINARY || 'gs';
 
 // Fail fast on missing / bad configuration
 const PLACEHOLDER_KEY = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
@@ -105,6 +113,38 @@ try {
   console.log('ClamAV daemon connected');
 } catch (err) {
   console.warn('ClamAV unavailable — uploads proceed without malware scanning:', err.message);
+}
+
+// ------------------- Ghostscript (optional PDF compression) -------------------
+let ghostscriptAvailable = false;
+try {
+  await execFileAsync(GS_BINARY, ['--version']);
+  ghostscriptAvailable = true;
+  console.log('Ghostscript found — PDF compression enabled');
+} catch (err) {
+  console.warn('Ghostscript unavailable — PDFs will be stored uncompressed:', err.message);
+}
+
+async function compressPdf(buf) {
+  if (!ghostscriptAvailable) return buf;
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'pratima-pdf-'));
+  const inPath = path.join(tmpDir, 'in.pdf');
+  const outPath = path.join(tmpDir, 'out.pdf');
+  try {
+    await fs.writeFile(inPath, buf);
+    await execFileAsync(GS_BINARY, [
+      '-sDEVICE=pdfwrite', '-dCompatibilityLevel=1.4', '-dPDFSETTINGS=/ebook',
+      '-dNOPAUSE', '-dQUIET', '-dBATCH', `-sOutputFile=${outPath}`, inPath,
+    ], { timeout: 60_000 });
+    const compressed = await fs.readFile(outPath);
+    // Only keep the compressed version if Ghostscript actually shrank it
+    return compressed.length > 0 && compressed.length < buf.length ? compressed : buf;
+  } catch (err) {
+    console.warn('Ghostscript compression failed — storing original PDF:', err.message);
+    return buf;
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+  }
 }
 
 // ------------------- Redis -------------------
@@ -227,11 +267,11 @@ function generateCompanyKey() {
 const COMPANY_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 // Legacy keys (company+filename derived) stay resolvable; new uploads use a UUID storage key.
 const LEGACY_IMAGE_ID_RE = /^pratima_[a-z0-9_]+$/;
-const UUID_IMAGE_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.webp$/i;
-const IMAGE_ID_RE = new RegExp(`(?:${LEGACY_IMAGE_ID_RE.source})|(?:${UUID_IMAGE_ID_RE.source})`, 'i');
+const UUID_ASSET_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.(webp|pdf)$/i;
+const IMAGE_ID_RE = new RegExp(`(?:${LEGACY_IMAGE_ID_RE.source})|(?:${UUID_ASSET_ID_RE.source})`, 'i');
 
-function isImageFile(filename) {
-  return LEGACY_IMAGE_ID_RE.test(filename) || UUID_IMAGE_ID_RE.test(filename);
+function isAssetFile(filename) {
+  return LEGACY_IMAGE_ID_RE.test(filename) || UUID_ASSET_ID_RE.test(filename);
 }
 
 // ------------------- Express setup -------------------
@@ -329,18 +369,121 @@ app.delete('/companies/:id', verifyApiKey, mgmtLimiter, async (req, res) => {
   res.json({ success: true });
 });
 
-// ------------------- Image Upload -------------------
+// ------------------- Company Domain Restriction -------------------
+// Optional per-company allow-list of hostnames permitted to fetch that company's files via
+// GET /img. Absent or empty = unrestricted (the default, and the only state any pre-existing
+// company will ever have unless someone explicitly opts in from the UI).
+app.put('/companies/:id/domains', verifyApiKey, mgmtLimiter, async (req, res) => {
+  const { id } = req.params;
+  if (!COMPANY_UUID_RE.test(id)) return res.status(400).json({ error: 'Invalid company ID' });
+
+  const { domains } = req.body;
+  if (!Array.isArray(domains) || !domains.every(d => typeof d === 'string')) {
+    return res.status(400).json({ error: 'domains must be an array of hostname strings (empty array = unrestricted)' });
+  }
+  const cleaned = [...new Set(domains.map(d => d.trim().toLowerCase()).filter(Boolean))];
+
+  let updated = null;
+  const found = await withCompaniesLock(async () => {
+    const list = await loadCompanies();
+    const co = list.find(c => c.id === id);
+    if (!co) return false;
+    co.allowedDomains = cleaned;
+    updated = co;
+    await saveCompanies(list);
+    return true;
+  });
+
+  if (!found) return res.status(404).json({ error: 'Company not found' });
+  console.log(`Updated allowed domains for ${updated.name} (${id}): ${cleaned.join(', ') || '(unrestricted)'}`);
+  res.json({ success: true, allowedDomains: cleaned });
+});
+
+// ------------------- Company Backup / Restore -------------------
+// Single-company ZIP snapshot of every stored file + metadata sidecar. Restore never touches
+// company.json (name/apiKey/allowedDomains stay whatever is live) — it only replaces file bytes,
+// so a stale backup can never resurrect a rotated/leaked API key.
+app.get('/companies/:id/backup', verifyApiKey, mgmtLimiter, async (req, res) => {
+  const { id } = req.params;
+  if (!COMPANY_UUID_RE.test(id)) return res.status(400).json({ error: 'Invalid company ID' });
+
+  const companies = await loadCompanies();
+  const company = companies.find(c => c.id === id);
+  if (!company) return res.status(404).json({ error: 'Company not found' });
+
+  const dir = path.join(STORAGE_PATH, 'companies', id);
+  const zip = new AdmZip();
+  zip.addFile('company.json', Buffer.from(JSON.stringify(company, null, 2)));
+
+  let fileCount = 0;
+  try {
+    const files = await fs.readdir(dir);
+    for (const f of files) {
+      zip.addFile(`files/${f}`, await fs.readFile(path.join(dir, f)));
+      fileCount++;
+    }
+  } catch (_) { /* company has no files yet — backup is still valid with just company.json */ }
+
+  const safeName = company.name.replace(/[^a-z0-9_-]+/gi, '_');
+  res.set('Content-Type', 'application/zip');
+  res.set('Content-Disposition', `attachment; filename="pratima-backup-${safeName}-${id}.zip"`);
+  res.send(zip.toBuffer());
+  console.log(`Backup created for ${company.name} (${id}) — ${fileCount} file(s)`);
+});
+
+const restoreUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: MAX_BACKUP_SIZE },
+});
+
+app.post('/companies/:id/restore', verifyApiKey, mgmtLimiter, restoreUpload.single('backup'), async (req, res) => {
+  const { id } = req.params;
+  if (!COMPANY_UUID_RE.test(id)) return res.status(400).json({ error: 'Invalid company ID' });
+  if (!req.file) return res.status(400).json({ error: 'No backup ZIP provided (field name: backup)' });
+
+  const companies = await loadCompanies();
+  const company = companies.find(c => c.id === id);
+  if (!company) return res.status(404).json({ error: 'Company not found — create it first, then restore its files into it' });
+
+  let zip;
+  try { zip = new AdmZip(req.file.buffer); }
+  catch { return res.status(400).json({ error: 'Invalid ZIP file' }); }
+
+  const companyDir = path.join(STORAGE_PATH, 'companies', id);
+  await fs.mkdir(companyDir, { recursive: true });
+
+  let restored = 0, skipped = 0;
+  for (const entry of zip.getEntries()) {
+    if (entry.isDirectory || !entry.entryName.startsWith('files/')) continue;
+
+    const basename = entry.entryName.slice('files/'.length);
+    // Only a flat filename is ever accepted — rejects nested paths / zip-slip traversal.
+    if (!basename || basename.includes('/') || basename.includes('\\')) { skipped++; continue; }
+
+    const assetName = basename.endsWith('.json') ? basename.slice(0, -5) : basename;
+    if (!isAssetFile(assetName)) { skipped++; continue; }
+
+    await fs.writeFile(path.join(companyDir, basename), entry.getData(), { mode: 0o600 });
+    restored++;
+  }
+
+  console.log(`Restored ${restored} file(s) for ${company.name} (${id}) from backup` +
+    (skipped ? `, skipped ${skipped} invalid entr${skipped === 1 ? 'y' : 'ies'}` : ''));
+  res.json({ success: true, restored, skipped });
+});
+
+// ------------------- Image / PDF Upload -------------------
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: MAX_FILE_SIZE },
   fileFilter: (_req, file, cb) => {
-    const ok = ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/tiff'].includes(file.mimetype);
+    const ok = ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/tiff', 'application/pdf'].includes(file.mimetype);
     cb(null, ok);
   },
 });
 
 app.post('/upload', uploadLimiter, upload.single('image'), async (req, res) => {
-  if (!req.file) return res.status(400).json({ error: 'No valid image file provided (accepted: JPEG, PNG, WebP, GIF, TIFF)' });
+  if (!req.file) return res.status(400).json({ error: 'No valid file provided (accepted: JPEG, PNG, WebP, GIF, TIFF, PDF)' });
 
   const companyId = req.body.company_id || req.query.company_id;
   if (!companyId) return res.status(400).json({ error: 'company_id is required' });
@@ -358,18 +501,29 @@ app.post('/upload', uploadLimiter, upload.single('image'), async (req, res) => {
   await acquireSlot();
   try {
     const buf = req.file.buffer;
-    const meta = await sharp(buf).metadata();
-    if (!meta.format) throw new Error('Unrecognised image format');
+    const isPdf = req.file.mimetype === 'application/pdf';
 
+    // Malware scan runs on the raw upload regardless of file type.
     if (clamscan) {
       const { isInfected, viruses } = await clamscan.scanStream(Readable.from(buf));
       if (isInfected) throw new Error(`Malware detected: ${viruses.join(', ')}`);
     }
 
-    // FIX: removed .withMetadata(false) — sharp strips metadata by default without this call.
-    // Calling .withMetadata(false) passes a falsy options object which may re-enable metadata.
-    const webpBuf = await sharp(buf).webp({ quality: WEBP_QUALITY }).toBuffer();
-    const encrypted = encryptBuffer(webpBuf);
+    let processedBuf, ext, contentType;
+    if (isPdf) {
+      ext = 'pdf';
+      contentType = 'application/pdf';
+      processedBuf = await compressPdf(buf); // no-op passthrough if Ghostscript isn't installed
+    } else {
+      const meta = await sharp(buf).metadata();
+      if (!meta.format) throw new Error('Unrecognised image format');
+      // FIX: removed .withMetadata(false) — sharp strips metadata by default without this call.
+      // Calling .withMetadata(false) passes a falsy options object which may re-enable metadata.
+      ext = 'webp';
+      contentType = 'image/webp';
+      processedBuf = await sharp(buf).webp({ quality: WEBP_QUALITY }).toBuffer();
+    }
+    const encrypted = encryptBuffer(processedBuf);
 
     const companyDir = path.join(STORAGE_PATH, 'companies', companyId);
     await fs.mkdir(companyDir, { recursive: true });
@@ -379,7 +533,7 @@ app.post('/upload', uploadLimiter, upload.single('image'), async (req, res) => {
     let imageId, targetPath;
     const MAX_ID_ATTEMPTS = 5;
     for (let attempt = 1; ; attempt++) {
-      imageId = `${uuidv4()}.webp`;
+      imageId = `${uuidv4()}.${ext}`;
       targetPath = path.join(companyDir, imageId);
       try {
         // 'wx' fails loudly (EEXIST) instead of silently overwriting on a collision.
@@ -397,12 +551,13 @@ app.post('/upload', uploadLimiter, upload.single('image'), async (req, res) => {
     const metaPath = path.join(companyDir, `${imageId}.json`);
     await fs.writeFile(metaPath, JSON.stringify({
       originalName: req.file.originalname,
+      contentType,
       uploadedAt: new Date().toISOString(),
     }), { mode: 0o600 });
 
-    console.log(`Stored ${imageId} for ${company.name} (${(webpBuf.length / 1024).toFixed(1)} KB WebP)`);
+    console.log(`Stored ${imageId} for ${company.name} (${(processedBuf.length / 1024).toFixed(1)} KB ${isPdf ? 'PDF' : 'WebP'})`);
 
-    res.json({ url: `${PUBLIC_URL}/img/${companyId}/${imageId}`, imageId, companyId });
+    res.json({ url: `${PUBLIC_URL}/img/${companyId}/${imageId}`, imageId, companyId, type: isPdf ? 'pdf' : 'image' });
   } catch (err) {
     console.error('Upload error:', err.message);
     res.status(400).json({ error: err.message });
@@ -420,15 +575,31 @@ app.get('/img/:company_id/:image_id', async (req, res) => {
   if (!IMAGE_ID_RE.test(image_id)) return res.status(400).send('Invalid image ID');
 
   try {
+    // Optional per-company domain allow-list. Absent/empty = unrestricted (unchanged default behavior).
+    const companies = await loadCompanies();
+    const company = companies.find(c => c.id === company_id);
+    if (!company) return res.status(404).send('Not found');
+
+    if (Array.isArray(company.allowedDomains) && company.allowedDomains.length > 0) {
+      const originHeader = req.headers.origin || req.headers.referer || '';
+      let hostname = '';
+      try { hostname = new URL(originHeader).hostname.toLowerCase(); } catch { /* missing/invalid origin */ }
+      if (!hostname || !company.allowedDomains.includes(hostname)) {
+        return res.status(403).send("This company's files are restricted to authorized domains");
+      }
+    }
+
     const companyDir = path.join(STORAGE_PATH, 'companies', company_id);
     const encrypted = await fs.readFile(path.join(companyDir, image_id));
     const decrypted = decryptBuffer(encrypted);
-    res.set('Content-Type', 'image/webp');
+
+    const isPdf = image_id.toLowerCase().endsWith('.pdf');
+    res.set('Content-Type', isPdf ? 'application/pdf' : 'image/webp');
     res.set('Cache-Control', 'public, max-age=31536000, immutable');
-    res.set('Access-Control-Allow-Origin', '*'); // allow embedding in other domains
+    res.set('Access-Control-Allow-Origin', '*'); // allow <img>/<embed> tags from other domains
 
     // Original filename (if we have it) surfaces only in Content-Disposition, never in the path.
-    if (UUID_IMAGE_ID_RE.test(image_id)) {
+    if (UUID_ASSET_ID_RE.test(image_id)) {
       try {
         const sidecar = JSON.parse(await fs.readFile(path.join(companyDir, `${image_id}.json`), 'utf-8'));
         if (sidecar.originalName) {
@@ -463,7 +634,7 @@ app.delete('/img/:company_id/:image_id', async (req, res) => {
   const filePath = path.join(companyDir, image_id);
   try {
     await fs.unlink(filePath);
-    if (UUID_IMAGE_ID_RE.test(image_id)) {
+    if (UUID_ASSET_ID_RE.test(image_id)) {
       await fs.unlink(path.join(companyDir, `${image_id}.json`)).catch(() => {});
     }
     console.log(`Deleted ${image_id} for ${company.name} (${company_id})`);
@@ -504,7 +675,7 @@ app.get('/ui/api/stats', async (_req, res) => {
   for (const co of companies) {
     const dir = path.join(STORAGE_PATH, 'companies', co.id);
     try {
-      const files = (await fs.readdir(dir)).filter(isImageFile);
+      const files = (await fs.readdir(dir)).filter(isAssetFile);
       totalImages += files.length;
       const sizes = await Promise.all(
         files.map(f => fs.stat(path.join(dir, f)).then(s => s.size).catch(() => 0))
@@ -522,6 +693,7 @@ app.get('/ui/api/stats', async (_req, res) => {
     activeSlots,
     redisStatus,
     clamavStatus: clamscan ? 'connected' : 'unavailable',
+    ghostscriptStatus: ghostscriptAvailable ? 'connected' : 'unavailable',
     config: {
       port: PORT,
       maxFileSize: MAX_FILE_SIZE,
@@ -542,12 +714,13 @@ app.get('/ui/api/images', async (req, res) => {
     if (filter && co.id !== filter) continue;
     const dir = path.join(STORAGE_PATH, 'companies', co.id);
     try {
-      const files = (await fs.readdir(dir)).filter(isImageFile);
+      const files = (await fs.readdir(dir)).filter(isAssetFile);
       const stats = await Promise.all(files.map(async f => {
         const s = await fs.stat(path.join(dir, f));
         return {
           id: f,
           url: `${PUBLIC_URL}/img/${co.id}/${f}`,
+          type: f.toLowerCase().endsWith('.pdf') ? 'pdf' : 'image',
           size: s.size,
           created: s.birthtime || s.mtime,
           company_id: co.id,
