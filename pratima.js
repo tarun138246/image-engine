@@ -34,6 +34,8 @@ const STORAGE_PATH = process.env.STORAGE_PATH || '/var/pratima';
 const REDIS_URL = process.env.REDIS_URL || 'redis://127.0.0.1:6379';
 const PUBLIC_URL = (process.env.PUBLIC_URL || `http://localhost:${PORT}`).replace(/\/$/, '');
 const GS_BINARY = process.env.GS_BINARY || 'gs';
+const PROTECT_HEALTH = process.env.PROTECT_HEALTH === 'true';
+const ALLOWED_IPS = process.env.ALLOWED_IPS ? process.env.ALLOWED_IPS.split(',').map(ip => ip.trim()) : [];
 
 // Fail fast on missing / bad configuration
 const PLACEHOLDER_KEY = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
@@ -310,7 +312,45 @@ const mgmtLimiter = rateLimit({
   message: { error: 'Management API rate limit exceeded' },
 });
 
-// API-key guard — localhost (server shell / health checks) bypasses
+// ------------------- Authentication Middleware -------------------
+
+// IP Whitelist middleware
+const ipWhitelist = (req, res, next) => {
+  if (ALLOWED_IPS.length === 0) return next();
+  const clientIP = req.ip;
+  // Check exact IP matches
+  if (ALLOWED_IPS.includes(clientIP)) return next();
+  // Check CIDR ranges if needed (basic implementation)
+  for (const allowedIP of ALLOWED_IPS) {
+    if (allowedIP.includes('/')) {
+      // Simple CIDR check for /24, /16, /8
+      const [range, bits] = allowedIP.split('/');
+      const rangeParts = range.split('.');
+      const ipParts = clientIP.replace('::ffff:', '').split('.');
+      if (ipParts.length === 4 && rangeParts.length === 4) {
+        let match = true;
+        const significantOctets = Math.floor(parseInt(bits) / 8);
+        const remainingBits = parseInt(bits) % 8;
+        for (let i = 0; i < significantOctets; i++) {
+          if (ipParts[i] !== rangeParts[i]) {
+            match = false;
+            break;
+          }
+        }
+        if (match && remainingBits > 0) {
+          const mask = 256 - Math.pow(2, 8 - remainingBits);
+          if ((parseInt(ipParts[significantOctets]) & mask) !== (parseInt(rangeParts[significantOctets]) & mask)) {
+            match = false;
+          }
+        }
+        if (match) return next();
+      }
+    }
+  }
+  return res.status(403).json({ error: 'Access denied from this IP address' });
+};
+
+// Basic API-key guard — localhost (server shell / health checks) bypasses
 const verifyApiKey = (req, res, next) => {
   const ip = req.ip;
   if (ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1') return next();
@@ -318,8 +358,147 @@ const verifyApiKey = (req, res, next) => {
   next();
 };
 
+// UI-specific API-key guard with HTML login form for /ui route
+const verifyApiKeyWithRedirect = (req, res, next) => {
+  const ip = req.ip;
+  
+  // Allow localhost without auth
+  if (ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1') return next();
+  
+  // Check for API key in header or query parameter
+  const apiKey = req.headers['x-api-key'] || req.query.key;
+  
+  if (apiKey === API_KEY) return next();
+  
+  // For HTML pages, show a login form instead of JSON error
+  if ((req.path === '/ui' || req.path === '/ui/') && req.accepts('html')) {
+    return res.status(401).send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Authentication Required - Pratima</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <style>
+          body { 
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: #080b0e; color: #e8edf2; display: flex; 
+            align-items: center; justify-content: center; min-height: 100vh;
+            margin: 0; line-height: 1.5;
+          }
+          .login-box {
+            background: #0e1318; border: 1px solid #1e2832; border-radius: 12px;
+            padding: 32px; max-width: 420px; width: 90%;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+          }
+          .logo { font-size: 24px; font-weight: 700; margin-bottom: 8px; display: flex; align-items: center; gap: 10px; }
+          .logo-icon {
+            width: 36px; height: 36px;
+            background: linear-gradient(135deg, #10b981 0%, #3b82f6 100%);
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 18px;
+          }
+          .logo-text { background: linear-gradient(135deg, #10b981, #3b82f6); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+          .subtitle { color: #5a6875; font-size: 13px; margin-bottom: 24px; }
+          input { 
+            width: 100%; padding: 10px 12px; background: #141c24; border: 1px solid #253040;
+            border-radius: 8px; color: #e8edf2; font-size: 14px; outline: none;
+            box-sizing: border-box; transition: border-color 0.15s;
+          }
+          input:focus { border-color: #10b981; }
+          button {
+            width: 100%; padding: 10px; background: #10b981; color: #000;
+            border: none; border-radius: 8px; font-weight: 600; font-size: 14px;
+            cursor: pointer; margin-top: 12px; transition: background 0.15s;
+          }
+          button:hover { background: #0ea774; }
+          button:disabled { opacity: 0.6; cursor: not-allowed; }
+          .error { 
+            color: #ef4444; font-size: 12px; margin-top: 8px; display: none; 
+            padding: 8px; background: rgba(239,68,68,0.1); border-radius: 6px;
+          }
+          .hint { color: #5a6875; font-size: 11px; margin-top: 16px; text-align: center; }
+          .spinner {
+            display: inline-block; width: 14px; height: 14px;
+            border: 2px solid rgba(0,0,0,0.3); border-top-color: #000;
+            border-radius: 50%; animation: spin 0.6s linear infinite;
+            vertical-align: middle; margin-right: 6px;
+          }
+          @keyframes spin { to { transform: rotate(360deg); } }
+        </style>
+      </head>
+      <body>
+        <div class="login-box">
+          <div class="logo">
+            <div class="logo-icon">⚡</div>
+            <span class="logo-text">Pratima</span>
+          </div>
+          <div class="subtitle">Dashboard Authentication</div>
+          <form onsubmit="authenticate(event)" id="login-form">
+            <input type="password" id="key" placeholder="Enter Admin API Key" autofocus autocomplete="off" />
+            <div class="error" id="error"></div>
+            <button type="submit" id="submit-btn">Authenticate</button>
+          </form>
+          <div class="hint">
+            Enter your global admin API key to access the dashboard.<br>
+            Localhost requests bypass authentication.
+          </div>
+        </div>
+        <script>
+          async function authenticate(e) {
+            e.preventDefault();
+            const key = document.getElementById('key').value.trim();
+            const btn = document.getElementById('submit-btn');
+            const error = document.getElementById('error');
+            
+            if (!key) {
+              error.textContent = 'Please enter an API key';
+              error.style.display = 'block';
+              return;
+            }
+            
+            btn.disabled = true;
+            btn.innerHTML = '<span class="spinner"></span>Authenticating...';
+            error.style.display = 'none';
+            
+            try {
+              const res = await fetch('/ui/api/stats', { 
+                headers: { 'x-api-key': key },
+                signal: AbortSignal.timeout(5000)
+              });
+              if (res.ok) {
+                sessionStorage.setItem('pratima_key', key);
+                window.location.reload();
+              } else {
+                error.textContent = 'Invalid API key. Please try again.';
+                error.style.display = 'block';
+              }
+            } catch (err) {
+              error.textContent = 'Connection failed. Check if the server is running.';
+              error.style.display = 'block';
+            } finally {
+              btn.disabled = false;
+              btn.innerHTML = 'Authenticate';
+              document.getElementById('key').focus();
+            }
+          }
+        </script>
+      </body>
+      </html>
+    `);
+  }
+  
+  // For API calls, check query parameter key as well
+  const queryKey = req.query.key;
+  if (queryKey === API_KEY) return next();
+  
+  return res.status(403).json({ error: 'Forbidden - valid API key required' });
+};
+
 // ------------------- Health -------------------
-app.get('/health', (_req, res) =>
+app.get('/health', PROTECT_HEALTH ? verifyApiKey : (_req, res, next) => next(), (_req, res) =>
   res.json({ status: 'ok', redis: redisReady, clamav: !!clamscan })
 );
 
@@ -647,7 +826,7 @@ app.delete('/img/:company_id/:image_id', async (req, res) => {
 });
 
 // ------------------- UI -------------------
-app.get('/ui', async (_req, res) => {
+app.get('/ui', verifyApiKeyWithRedirect, ipWhitelist, async (_req, res) => {
   try {
     let html = await fs.readFile(path.join(__dirname, 'ui.html'), 'utf-8');
     // Inject the global API_KEY into a <script> variable (never hard‑coded in the HTML)
@@ -660,7 +839,7 @@ app.get('/ui', async (_req, res) => {
   }
 });
 
-app.get('/ui/api/stats', async (_req, res) => {
+app.get('/ui/api/stats', verifyApiKeyWithRedirect, ipWhitelist, async (_req, res) => {
   let redisStatus = 'disconnected';
   let activeSlots = 0;
   try {
@@ -705,7 +884,7 @@ app.get('/ui/api/stats', async (_req, res) => {
   });
 });
 
-app.get('/ui/api/images', async (req, res) => {
+app.get('/ui/api/images', verifyApiKeyWithRedirect, ipWhitelist, async (req, res) => {
   const filter = req.query.company_id;
   const companies = await loadCompanies();
   const images = [];
@@ -736,7 +915,7 @@ app.get('/ui/api/images', async (req, res) => {
 });
 
 // SSE log stream — sends buffered history then streams live entries
-app.get('/ui/api/logs', (req, res) => {
+app.get('/ui/api/logs', verifyApiKeyWithRedirect, ipWhitelist, (req, res) => {
   res.set({
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
@@ -765,6 +944,8 @@ app.use((err, _req, res, _next) => {
 const server = app.listen(PORT, HOST, () => {
   console.log(`Pratima image engine listening on http://${HOST}:${PORT}`);
   console.log(`Dashboard: http://${HOST}:${PORT}/ui`);
+  console.log('Authentication: Required for all UI and management endpoints');
+  console.log('Security: AES-256-GCM encryption, ClamAV scanning, rate limiting, IP whitelisting available');
 });
 
 async function shutdown(signal) {

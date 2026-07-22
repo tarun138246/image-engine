@@ -1,6 +1,6 @@
 # Pratima Image Engine — API Reference
 
-Base URL: `http://139.99.133.189`
+Base URL: `https://pratima.homecarehelp.in`
 
 ---
 

@@ -90,6 +90,21 @@
       animation: pulse 2.2s ease-in-out infinite;
     }
     @keyframes pulse { 0%,100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.5; transform: scale(0.85); } }
+    .logout-btn {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--muted);
+      padding: 3px 10px;
+      border-radius: 6px;
+      font-size: 11px;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .logout-btn:hover {
+      background: var(--red-dim);
+      border-color: rgba(239,68,68,0.3);
+      color: var(--red);
+    }
 
     /* ---- Tabs ---- */
     .tabs {
@@ -417,6 +432,7 @@
       <div class="pulse-dot"></div>
       Online
     </div>
+    <button class="logout-btn" onclick="logout()" title="Clear stored API key">Logout</button>
   </div>
 </header>
 
@@ -463,14 +479,14 @@
         <div class="data-row"><span class="data-key">Health Check</span><span class="data-val">GET /health</span></div>
         <div class="data-row"><span class="data-key">Upload Image/PDF</span><span class="data-val">POST /upload · x-api-key header · multipart/form-data · company_id required</span></div>
         <div class="data-row"><span class="data-key">Retrieve File</span><span class="data-val">GET /img/:company_id/:image_id</span></div>
-        <div class="data-row"><span class="data-key">Delete File</span><span class="data-val">DELETE /img/:company_id/:image_id · company’s own API key</span></div>
+        <div class="data-row"><span class="data-key">Delete File</span><span class="data-val">DELETE /img/:company_id/:image_id · company's own API key</span></div>
         <div class="data-row"><span class="data-key">Companies</span><span class="data-val">GET /companies · POST /companies · DELETE /companies/:id · all require x-api-key</span></div>
         <div class="data-row"><span class="data-key">Domain Restriction</span><span class="data-val">PUT /companies/:id/domains {domains:[…]} · x-api-key</span></div>
         <div class="data-row"><span class="data-key">Backup / Restore</span><span class="data-val">GET /companies/:id/backup · POST /companies/:id/restore · x-api-key</span></div>
-        <div class="data-row"><span class="data-key">Dashboard UI</span><span class="data-val">GET /ui</span></div>
-        <div class="data-row"><span class="data-key">Stats API</span><span class="data-val">GET /ui/api/stats</span></div>
-        <div class="data-row"><span class="data-key">Images API</span><span class="data-val">GET /ui/api/images?company_id=…</span></div>
-        <div class="data-row"><span class="data-key">Logs Stream</span><span class="data-val">GET /ui/api/logs · SSE</span></div>
+        <div class="data-row"><span class="data-key">Dashboard UI</span><span class="data-val">GET /ui · x-api-key required</span></div>
+        <div class="data-row"><span class="data-key">Stats API</span><span class="data-val">GET /ui/api/stats · x-api-key required</span></div>
+        <div class="data-row"><span class="data-key">Images API</span><span class="data-val">GET /ui/api/images?company_id=… · x-api-key required</span></div>
+        <div class="data-row"><span class="data-key">Logs Stream</span><span class="data-val">GET /ui/api/logs · SSE · x-api-key required</span></div>
       </div>
     </div>
 
@@ -478,7 +494,7 @@
       <div class="section-header"><span class="section-title">Security</span></div>
       <div class="data-table">
         <div class="data-row"><span class="data-key">Encryption</span><span class="data-val">AES-256-GCM · per-file random IV · 16-byte auth tag</span></div>
-        <div class="data-row"><span class="data-key">Auth</span><span class="data-val">x-api-key header (upload, company management, /companies GET)</span></div>
+        <div class="data-row"><span class="data-key">Auth</span><span class="data-val">x-api-key header (upload, company management, /companies GET, UI dashboard)</span></div>
         <div class="data-row"><span class="data-key">Accepted formats</span><span class="data-val">JPEG · PNG · WebP · GIF · TIFF · PDF</span></div>
         <div class="data-row"><span class="data-key">Output format</span><span class="data-val">Images → WebP (EXIF/metadata stripped) · PDFs → Ghostscript-compressed (stored as-is if Ghostscript unavailable)</span></div>
         <div class="data-row"><span class="data-key">Storage key</span><span class="data-val">Server-generated UUID v4 — never the client filename; original name kept only as Content-Disposition metadata</span></div>
@@ -566,12 +582,51 @@
 <input type="file" id="restore-file-input" accept=".zip" style="display:none" onchange="handleRestoreFileChosen(event)" />
 
 <script>
+  // ---- Authentication Helpers ----
+  const STORAGE_KEY = 'pratima_key';
+
+  function getStoredKey() {
+    return sessionStorage.getItem(STORAGE_KEY) || '';
+  }
+
+  function setStoredKey(key) {
+    sessionStorage.setItem(STORAGE_KEY, key);
+  }
+
+  function logout() {
+    sessionStorage.removeItem(STORAGE_KEY);
+    // Force re-authentication by redirecting to /ui which will show the login form
+    window.location.href = '/ui';
+  }
+
+  function handleAuthFailure() {
+    sessionStorage.removeItem(STORAGE_KEY);
+    alert('Your session has expired or the API key is invalid. You will be redirected to the login page.');
+    window.location.href = '/ui';
+  }
+
+  // Modified authHeaders function to include UI auth
+  function authHeaders(extra, overrideKey) {
+    const key = overrideKey || getStoredKey() || apiKey;
+    return Object.assign({ 'x-api-key': key }, extra || {});
+  }
+
+  // Unified fetch wrapper that adds auth headers
+  async function uiFetch(url, options = {}) {
+    const storedKey = getStoredKey();
+    if (storedKey) {
+      options.headers = Object.assign({}, options.headers || {}, { 'x-api-key': storedKey });
+    }
+    const res = await fetch(url, options);
+    if (res.status === 401 || res.status === 403) {
+      handleAuthFailure();
+      throw new Error('Authentication required');
+    }
+    return res;
+  }
+
   // ---- Global admin key injected by server (no manual entry) ----
   const apiKey = window.PRATIMA_GLOBAL_API_KEY || '';
-
-  function authHeaders(extra, overrideKey) {
-    return Object.assign({ 'x-api-key': overrideKey || apiKey }, extra || {});
-  }
 
   // ---- State ----
   let allImages     = [];
@@ -646,7 +701,7 @@
   // ---- Stats ----
   async function loadStats() {
     try {
-      const r = await fetch('/ui/api/stats');
+      const r = await uiFetch('/ui/api/stats');
       if (!r.ok) throw new Error(r.statusText);
       const d = await r.json();
 
@@ -693,11 +748,10 @@
   async function loadCompanies() {
     document.getElementById('company-list').innerHTML = '<div class="loading-center"><div class="spinner"></div></div>';
     try {
-      const r = await apiFetch('/companies');
+      const r = await uiFetch('/companies');
       if (!r.ok) throw new Error(r.statusText);
       companies = await r.json();
       renderCompanies();
-      // No company selector needed for images anymore; but we still keep it for potential use
     } catch (e) {
       document.getElementById('company-list').innerHTML =
         '<div class="empty-state"><div class="empty-icon">⚠</div>' +
@@ -763,7 +817,7 @@
 
   async function updateDomains(id, domains) {
     try {
-      const r = await apiFetch('/companies/' + encodeURIComponent(id) + '/domains', {
+      const r = await uiFetch('/companies/' + encodeURIComponent(id) + '/domains', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ domains }),
@@ -779,7 +833,7 @@
   // ---- Backup / Restore (single company) ----
   async function downloadBackup(id, name) {
     try {
-      const r = await apiFetch('/companies/' + encodeURIComponent(id) + '/backup');
+      const r = await uiFetch('/companies/' + encodeURIComponent(id) + '/backup');
       if (!r.ok) throw new Error((await r.json().catch(() => ({ error: r.statusText }))).error);
       const blob = await r.blob();
       const url = URL.createObjectURL(blob);
@@ -815,7 +869,7 @@
     try {
       const form = new FormData();
       form.append('backup', file);
-      const r = await apiFetch('/companies/' + encodeURIComponent(id) + '/restore', { method: 'POST', body: form });
+      const r = await uiFetch('/companies/' + encodeURIComponent(id) + '/restore', { method: 'POST', body: form });
       const data = await r.json();
       if (!r.ok) throw new Error(data.error);
       showToast('Restored ' + data.restored + ' file(s)' + (data.skipped ? ', skipped ' + data.skipped : ''));
@@ -831,7 +885,7 @@
     const name  = input.value.trim();
     if (!name) return alert('Please enter a company name');
     try {
-      const r = await apiFetch('/companies', {
+      const r = await uiFetch('/companies', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name }),
@@ -855,7 +909,7 @@
   async function deleteCompany(id, name) {
     if (!confirm('Delete company "' + name + '" and ALL its images? This cannot be undone.')) return;
     try {
-      const r = await apiFetch('/companies/' + encodeURIComponent(id), { method: 'DELETE' });
+      const r = await uiFetch('/companies/' + encodeURIComponent(id), { method: 'DELETE' });
       if (!r.ok) throw new Error((await r.json()).error);
       loadCompanies();
       loadStats();
@@ -864,13 +918,13 @@
     }
   }
 
-  // ---- API Fetch with 403 handling (not needed now, but kept for safety) ----
+  // ---- API Fetch with auth ----
   async function apiFetch(url, options) {
     options = options || {};
     const headers = authHeaders(options.headers || {});
     const res = await fetch(url, Object.assign({}, options, { headers }));
-    if (res.status === 403) {
-      alert('Access denied. The global admin key might be invalid. Reload the page or contact the administrator.');
+    if (res.status === 401 || res.status === 403) {
+      handleAuthFailure();
       throw new Error('Forbidden');
     }
     return res;
@@ -881,7 +935,7 @@
     const container = document.getElementById('images-container');
     container.innerHTML = '<div class="loading-center"><div class="spinner"></div></div>';
     try {
-      const r = await fetch('/ui/api/images');
+      const r = await uiFetch('/ui/api/images');
       if (!r.ok) throw new Error(r.statusText);
       allImages    = await r.json();
       imagesLoaded = true;
@@ -952,7 +1006,7 @@
     document.getElementById('img-count-label').textContent = totalCount + ' image' + (totalCount !== 1 ? 's' : '');
   }
 
-  // Event delegation for image cards (unchanged)
+  // Event delegation for image cards
   document.getElementById('images-container').addEventListener('click', function(e) {
     const card = e.target.closest('.img-card[data-key]');
     if (!card) return;
@@ -1020,7 +1074,7 @@
     const companyId = parts[1];
     const imageId   = parts[2];
 
-    const companyKey = prompt('Enter the company’s own API key (prtm_…) to delete this image:');
+    const companyKey = prompt('Enter the company\'s own API key (prtm_…) to delete this image:');
     if (!companyKey) return;
 
     if (!confirm('Permanently delete this image? This cannot be undone.')) return;
@@ -1118,7 +1172,10 @@
 
   // ---- SSE Log Stream ----
   function connectSSE() {
-    const es = new EventSource('/ui/api/logs');
+    const storedKey = getStoredKey();
+    // Pass API key as query parameter for EventSource (can't set custom headers on EventSource)
+    const url = storedKey ? `/ui/api/logs?key=${encodeURIComponent(storedKey)}` : '/ui/api/logs';
+    const es = new EventSource(url);
     es.onmessage = function(e) {
       try { appendLog(JSON.parse(e.data)); } catch (_) {}
     };
