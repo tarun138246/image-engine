@@ -447,6 +447,10 @@ const verifyApiKeyWithRedirect = (req, res, next) => {
           </div>
         </div>
         <script>
+
+        if (location.search.includes('key=')) {
+          history.replaceState({}, '', location.pathname);
+        }
           async function authenticate(e) {
             e.preventDefault();
             const key = document.getElementById('key').value.trim();
@@ -470,7 +474,7 @@ const verifyApiKeyWithRedirect = (req, res, next) => {
               });
               if (res.ok) {
                 sessionStorage.setItem('pratima_key', key);
-                window.location.reload();
+                window.location.href = '/ui?key=' + encodeURIComponent(key);
               } else {
                 error.textContent = 'Invalid API key. Please try again.';
                 error.style.display = 'block';
@@ -829,9 +833,18 @@ app.delete('/img/:company_id/:image_id', async (req, res) => {
 app.get('/ui', verifyApiKeyWithRedirect, ipWhitelist, async (_req, res) => {
   try {
     let html = await fs.readFile(path.join(__dirname, 'ui.html'), 'utf-8');
-    // Inject the global API_KEY into a <script> variable (never hard‑coded in the HTML)
-    const injectedKey = JSON.stringify(API_KEY);   // safe for JavaScript strings
-    html = html.replace('<!-- PRATIMA_API_KEY -->', `<script>window.PRATIMA_GLOBAL_API_KEY = ${injectedKey};</script>`);
+    const injectedKey = JSON.stringify(API_KEY);
+    // FIX: inject a script that captures ?key= from the URL into sessionStorage
+    // so uiFetch() finds the key on the very first dashboard load.
+    const injectedScript = `<script>
+      window.PRATIMA_GLOBAL_API_KEY = ${injectedKey};
+      (function(){
+        var p = new URLSearchParams(location.search);
+        var k = p.get('key');
+        if (k) { sessionStorage.setItem('pratima_key', k); history.replaceState({}, '', location.pathname); }
+      })();
+    </script>`;
+    html = html.replace('<!-- PRATIMA_API_KEY -->', injectedScript);
     res.set('Content-Type', 'text/html; charset=utf-8');
     res.send(html);
   } catch (err) {
