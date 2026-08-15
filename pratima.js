@@ -31,6 +31,8 @@ const MAX_BACKUP_SIZE = parseInt(process.env.MAX_BACKUP_SIZE, 10) || 200 * 1024 
 const WEBP_QUALITY = parseInt(process.env.WEBP_QUALITY, 10) || 92;
 const CONCURRENCY_LIMIT = parseInt(process.env.CONCURRENCY_LIMIT, 10) || 2;
 const STORAGE_PATH = process.env.STORAGE_PATH || '/var/pratima';
+const SCHEDULED_DELETION_PATH = path.join(STORAGE_PATH, 'scheduled-deletion');
+const DELETION_RETENTION_DAYS = parseInt(process.env.DELETION_RETENTION_DAYS, 10) || 25;
 const REDIS_URL = process.env.REDIS_URL || 'redis://127.0.0.1:6379';
 const PUBLIC_URL = (process.env.PUBLIC_URL || `http://localhost:${PORT}`).replace(/\/$/, '');
 const GS_BINARY = process.env.GS_BINARY || 'gs';
@@ -83,6 +85,7 @@ console.error = (...a) => { _error(...a); emitLog('error', ...a); };
 
 // ------------------- Storage & Companies -------------------
 await fs.mkdir(STORAGE_PATH, { recursive: true });
+await fs.mkdir(SCHEDULED_DELETION_PATH, { recursive: true });
 const COMPANIES_FILE = path.join(STORAGE_PATH, 'companies.json');
 
 // Simple in-process mutex to serialise companies.json writes
@@ -263,6 +266,130 @@ function decryptBuffer(buf) {
 function generateCompanyKey() {
   return 'prtm_' + crypto.randomBytes(24).toString('hex'); // 53-char unguessable key
 }
+
+// ------------------- Scheduled Deletion Helpers -------------------
+async function moveToScheduledDeletion(companyId, companyName, itemType, itemId = null) {
+  const timestamp = Date.now();
+  const deletionId = uuidv4();
+  const deletionFolder = path.join(SCHEDULED_DELETION_PATH, deletionId);
+  
+  await fs.mkdir(deletionFolder, { recursive: true });
+  
+  // Save deletion metadata
+  const metadata = {
+    deletionId,
+    companyId,
+    companyName,
+    itemType, // 'company' or 'image'
+    imageId: itemId,
+    deletedAt: new Date(timestamp).toISOString(),
+    scheduledPermanentDeletionAt: new Date(timestamp + (DELETION_RETENTION_DAYS * 24 * 60 * 60 * 1000)).toISOString(),
+    timestamp
+  };
+  
+  await fs.writeFile(
+    path.join(deletionFolder, 'metadata.json'),
+    JSON.stringify(metadata, null, 2),
+    'utf-8'
+  );
+  
+  // Move the actual files
+  if (itemType === 'company') {
+    // Move entire company folder
+    const sourceDir = path.join(STORAGE_PATH, 'companies', companyId);
+    const targetDir = path.join(deletionFolder, 'files');
+    try {
+      await fs.rename(sourceDir, targetDir);
+      console.log(`Moved company ${companyName} (${companyId}) to scheduled deletion (${deletionId})`);
+    } catch (err) {
+      if (err.code !== 'ENOENT') throw err;
+      // Company folder doesn't exist (no files uploaded yet)
+      console.log(`Company ${companyName} (${companyId}) had no files - metadata saved to scheduled deletion`);
+    }
+  } else if (itemType === 'image') {
+    // Move individual image file and its metadata
+    const companyDir = path.join(STORAGE_PATH, 'companies', companyId);
+    const targetDir = path.join(deletionFolder, 'files');
+    await fs.mkdir(targetDir, { recursive: true });
+    
+    const imageFile = path.join(companyDir, itemId);
+    const targetImageFile = path.join(targetDir, itemId);
+    await fs.rename(imageFile, targetImageFile);
+    
+    // Move JSON metadata if exists
+    if (UUID_ASSET_ID_RE.test(itemId)) {
+      const metaFile = path.join(companyDir, `${itemId}.json`);
+      const targetMetaFile = path.join(targetDir, `${itemId}.json`);
+      await fs.rename(metaFile, targetMetaFile).catch(() => {});
+    }
+    
+    console.log(`Moved image ${itemId} from company ${companyName} to scheduled deletion (${deletionId})`);
+  }
+  
+  return deletionId;
+}
+
+async function cleanupExpiredDeletions() {
+  try {
+    const now = Date.now();
+    const entries = await fs.readdir(SCHEDULED_DELETION_PATH);
+    
+    let deletedCount = 0;
+    let totalSize = 0;
+    
+    for (const entry of entries) {
+      const deletionFolder = path.join(SCHEDULED_DELETION_PATH, entry);
+      const metadataFile = path.join(deletionFolder, 'metadata.json');
+      
+      try {
+        const stat = await fs.stat(deletionFolder);
+        if (!stat.isDirectory()) continue;
+        
+        const metadata = JSON.parse(await fs.readFile(metadataFile, 'utf-8'));
+        const expiryTime = metadata.timestamp + (DELETION_RETENTION_DAYS * 24 * 60 * 60 * 1000);
+        
+        if (now >= expiryTime) {
+          // Calculate size before deletion
+          const filesDir = path.join(deletionFolder, 'files');
+          try {
+            const files = await fs.readdir(filesDir);
+            for (const file of files) {
+              const fileStat = await fs.stat(path.join(filesDir, file));
+              totalSize += fileStat.size;
+            }
+          } catch (err) { /* files dir might not exist */ }
+          
+          // Permanently delete
+          await fs.rm(deletionFolder, { recursive: true, force: true });
+          deletedCount++;
+          
+          console.log(
+            `Permanently deleted ${metadata.itemType} ` +
+            `(${metadata.itemType === 'company' ? metadata.companyName : metadata.imageId}) ` +
+            `after ${DELETION_RETENTION_DAYS} days`
+          );
+        }
+      } catch (err) {
+        console.warn(`Failed to process scheduled deletion ${entry}:`, err.message);
+      }
+    }
+    
+    if (deletedCount > 0) {
+      console.log(
+        `Cleanup complete: permanently deleted ${deletedCount} item(s), ` +
+        `freed ${(totalSize / 1024 / 1024).toFixed(2)} MB`
+      );
+    }
+  } catch (err) {
+    console.error('Scheduled deletion cleanup failed:', err);
+  }
+}
+
+// Run cleanup on startup
+await cleanupExpiredDeletions();
+
+// Schedule periodic cleanup (runs every 6 hours)
+setInterval(cleanupExpiredDeletions, 6 * 60 * 60 * 1000);
 
 // ------------------- Validation helpers -------------------
 // FIX: strict regex prevents path-traversal in image_id
@@ -544,12 +671,23 @@ app.delete('/companies/:id', verifyApiKey, mgmtLimiter, async (req, res) => {
 
   if (!found) return res.status(404).json({ error: 'Company not found' });
 
-  const dir = path.join(STORAGE_PATH, 'companies', removed.id);
-  try { await fs.rm(dir, { recursive: true, force: true }); }
-  catch (e) { console.warn(`Failed to remove company dir ${dir}:`, e.message); }
-
-  console.log(`Company deleted: ${removed.name} (${removed.id})`);
-  res.json({ success: true });
+  // Move to scheduled deletion instead of permanent delete
+  try {
+    const deletionId = await moveToScheduledDeletion(removed.id, removed.name, 'company');
+    console.log(`Company deleted (soft): ${removed.name} (${removed.id}) - deletion ID: ${deletionId}`);
+    res.json({ 
+      success: true, 
+      deletionId,
+      message: `Company moved to scheduled deletion. Will be permanently deleted after ${DELETION_RETENTION_DAYS} days.`
+    });
+  } catch (e) {
+    console.error(`Failed to move company ${removed.id} to scheduled deletion:`, e.message);
+    // Fallback: if scheduled deletion fails, we've already removed from companies.json
+    res.json({ 
+      success: true,
+      warning: 'Company removed from system but scheduled deletion failed'
+    });
+  }
 });
 
 // ------------------- Company Domain Restriction -------------------
@@ -815,17 +953,202 @@ app.delete('/img/:company_id/:image_id', async (req, res) => {
 
   const companyDir = path.join(STORAGE_PATH, 'companies', company_id);
   const filePath = path.join(companyDir, image_id);
+  
   try {
-    await fs.unlink(filePath);
-    if (UUID_ASSET_ID_RE.test(image_id)) {
-      await fs.unlink(path.join(companyDir, `${image_id}.json`)).catch(() => {});
-    }
-    console.log(`Deleted ${image_id} for ${company.name} (${company_id})`);
-    return res.json({ success: true });
+    // Check if file exists
+    await fs.access(filePath);
+    
+    // Move to scheduled deletion instead of permanent delete
+    const deletionId = await moveToScheduledDeletion(company_id, company.name, 'image', image_id);
+    
+    console.log(`Image deleted (soft): ${image_id} for ${company.name} (${company_id}) - deletion ID: ${deletionId}`);
+    return res.json({ 
+      success: true,
+      deletionId,
+      message: `Image moved to scheduled deletion. Will be permanently deleted after ${DELETION_RETENTION_DAYS} days.`
+    });
   } catch (err) {
     if (err.code === 'ENOENT') return res.status(404).json({ error: 'Image not found' });
     console.error('Delete error:', err);
     return res.status(500).json({ error: 'Failed to delete image' });
+  }
+});
+
+// ------------------- Scheduled Deletion Management -------------------
+// List all items in scheduled deletion
+app.get('/scheduled-deletions', verifyApiKey, async (_req, res) => {
+  try {
+    const entries = await fs.readdir(SCHEDULED_DELETION_PATH);
+    const deletions = [];
+    
+    for (const entry of entries) {
+      const deletionFolder = path.join(SCHEDULED_DELETION_PATH, entry);
+      const metadataFile = path.join(deletionFolder, 'metadata.json');
+      
+      try {
+        const stat = await fs.stat(deletionFolder);
+        if (!stat.isDirectory()) continue;
+        
+        const metadata = JSON.parse(await fs.readFile(metadataFile, 'utf-8'));
+        
+        // Calculate days remaining
+        const now = Date.now();
+        const expiryTime = metadata.timestamp + (DELETION_RETENTION_DAYS * 24 * 60 * 60 * 1000);
+        const daysRemaining = Math.ceil((expiryTime - now) / (24 * 60 * 60 * 1000));
+        
+        deletions.push({
+          ...metadata,
+          daysRemaining,
+          canRestore: daysRemaining > 0
+        });
+      } catch (err) {
+        console.warn(`Failed to read scheduled deletion ${entry}:`, err.message);
+      }
+    }
+    
+    // Sort by deletion date (most recent first)
+    deletions.sort((a, b) => b.timestamp - a.timestamp);
+    
+    res.json({ deletions, retentionDays: DELETION_RETENTION_DAYS });
+  } catch (err) {
+    console.error('Failed to list scheduled deletions:', err);
+    res.status(500).json({ error: 'Failed to list scheduled deletions' });
+  }
+});
+
+// Restore a company or image from scheduled deletion
+app.post('/scheduled-deletions/:deletionId/restore', verifyApiKey, mgmtLimiter, async (req, res) => {
+  const { deletionId } = req.params;
+  
+  const deletionFolder = path.join(SCHEDULED_DELETION_PATH, deletionId);
+  const metadataFile = path.join(deletionFolder, 'metadata.json');
+  
+  try {
+    const metadata = JSON.parse(await fs.readFile(metadataFile, 'utf-8'));
+    
+    // Check if still within retention period
+    const now = Date.now();
+    const expiryTime = metadata.timestamp + (DELETION_RETENTION_DAYS * 24 * 60 * 60 * 1000);
+    if (now >= expiryTime) {
+      return res.status(410).json({ error: 'This item has already been permanently deleted' });
+    }
+    
+    if (metadata.itemType === 'company') {
+      // Restore company
+      // First, check if company ID still exists in companies.json
+      const companies = await loadCompanies();
+      const existingCompany = companies.find(c => c.id === metadata.companyId);
+      
+      if (!existingCompany) {
+        return res.status(400).json({ 
+          error: 'Cannot restore: Company no longer exists in system. Please recreate the company first.' 
+        });
+      }
+      
+      // Move files back to company folder
+      const sourceDir = path.join(deletionFolder, 'files');
+      const targetDir = path.join(STORAGE_PATH, 'companies', metadata.companyId);
+      
+      try {
+        await fs.access(sourceDir);
+        await fs.rename(sourceDir, targetDir);
+        console.log(`Restored company ${metadata.companyName} (${metadata.companyId}) from scheduled deletion`);
+      } catch (err) {
+        if (err.code === 'ENOENT') {
+          console.log(`Company ${metadata.companyName} had no files to restore`);
+        } else {
+          throw err;
+        }
+      }
+      
+      // Remove from scheduled deletion
+      await fs.rm(deletionFolder, { recursive: true, force: true });
+      
+      res.json({ 
+        success: true, 
+        message: `Company ${metadata.companyName} restored successfully`,
+        itemType: 'company',
+        companyId: metadata.companyId
+      });
+      
+    } else if (metadata.itemType === 'image') {
+      // Restore individual image
+      const companies = await loadCompanies();
+      const company = companies.find(c => c.id === metadata.companyId);
+      
+      if (!company) {
+        return res.status(400).json({ 
+          error: 'Cannot restore: Parent company no longer exists' 
+        });
+      }
+      
+      const sourceDir = path.join(deletionFolder, 'files');
+      const targetDir = path.join(STORAGE_PATH, 'companies', metadata.companyId);
+      await fs.mkdir(targetDir, { recursive: true });
+      
+      // Move image file back
+      const sourceImageFile = path.join(sourceDir, metadata.imageId);
+      const targetImageFile = path.join(targetDir, metadata.imageId);
+      await fs.rename(sourceImageFile, targetImageFile);
+      
+      // Move metadata file back if exists
+      if (UUID_ASSET_ID_RE.test(metadata.imageId)) {
+        const sourceMetaFile = path.join(sourceDir, `${metadata.imageId}.json`);
+        const targetMetaFile = path.join(targetDir, `${metadata.imageId}.json`);
+        await fs.rename(sourceMetaFile, targetMetaFile).catch(() => {});
+      }
+      
+      // Remove from scheduled deletion
+      await fs.rm(deletionFolder, { recursive: true, force: true });
+      
+      console.log(`Restored image ${metadata.imageId} from company ${metadata.companyName}`);
+      
+      res.json({ 
+        success: true, 
+        message: `Image ${metadata.imageId} restored successfully`,
+        itemType: 'image',
+        companyId: metadata.companyId,
+        imageId: metadata.imageId,
+        imageUrl: `${PUBLIC_URL}/img/${metadata.companyId}/${metadata.imageId}`
+      });
+    }
+  } catch (err) {
+    if (err.code === 'ENOENT') {
+      return res.status(404).json({ error: 'Scheduled deletion not found' });
+    }
+    console.error('Restore error:', err);
+    res.status(500).json({ error: 'Failed to restore item' });
+  }
+});
+
+// Permanently delete an item from scheduled deletion (skip retention period)
+app.delete('/scheduled-deletions/:deletionId', verifyApiKey, mgmtLimiter, async (req, res) => {
+  const { deletionId } = req.params;
+  
+  const deletionFolder = path.join(SCHEDULED_DELETION_PATH, deletionId);
+  const metadataFile = path.join(deletionFolder, 'metadata.json');
+  
+  try {
+    const metadata = JSON.parse(await fs.readFile(metadataFile, 'utf-8'));
+    
+    // Permanently delete
+    await fs.rm(deletionFolder, { recursive: true, force: true });
+    
+    console.log(
+      `Manually permanently deleted ${metadata.itemType} ` +
+      `(${metadata.itemType === 'company' ? metadata.companyName : metadata.imageId})`
+    );
+    
+    res.json({ 
+      success: true,
+      message: `${metadata.itemType === 'company' ? 'Company' : 'Image'} permanently deleted`
+    });
+  } catch (err) {
+    if (err.code === 'ENOENT') {
+      return res.status(404).json({ error: 'Scheduled deletion not found' });
+    }
+    console.error('Permanent delete error:', err);
+    res.status(500).json({ error: 'Failed to permanently delete item' });
   }
 });
 
