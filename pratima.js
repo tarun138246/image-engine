@@ -7,17 +7,26 @@ import sharp from 'sharp';
 import { v4 as uuidv4 } from 'uuid';
 import crypto from 'crypto';
 import fs from 'fs/promises';
+import { createWriteStream } from 'fs';
 import path from 'path';
 import { Readable } from 'stream';
+import { pipeline as streamPipeline } from 'stream/promises';
 import Redis from 'ioredis';
 import NodeClam from 'clamscan';
-import AdmZip from 'adm-zip';
+import archiver from 'archiver';
+import yauzl from 'yauzl';
 import { fileURLToPath } from 'url';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import os from 'os';
 
 const execFileAsync = promisify(execFile);
+
+// ------------------- Sharp tuning (fix #4) -------------------
+// Disable the in-process op cache and pin libvips to a single worker thread.
+// Keeps RSS flat on small VPSes; we only ever do one-shot encodes.
+sharp.cache(false);
+sharp.concurrency(1);
 
 // ------------------- Configuration & Startup Validation -------------------
 const PORT = process.env.PORT || 3001;
@@ -26,9 +35,15 @@ const API_KEY = process.env.API_KEY;
 const ENC_KEY_HEX = process.env.ENCRYPTION_KEY || '';
 
 const CLAMD_SOCKET = process.env.CLAMD_SOCKET || '/var/run/clamav/clamd.ctl';
+// fix #7 — explicit fail-open/fail-closed policy when a scan cannot complete.
+// 'true'  → log and let the upload through (default, matches previous startup behaviour)
+// 'false' → reject the upload with 503
+const CLAMAV_FAIL_OPEN = (process.env.CLAMAV_FAIL_OPEN || 'true').toLowerCase() !== 'false';
+
 const MAX_FILE_SIZE = parseInt(process.env.MAX_FILE_SIZE, 10) || 10 * 1024 * 1024;
 const MAX_BACKUP_SIZE = parseInt(process.env.MAX_BACKUP_SIZE, 10) || 200 * 1024 * 1024;
-const WEBP_QUALITY = parseInt(process.env.WEBP_QUALITY, 10) || 92;
+const MAX_INPUT_PIXELS = parseInt(process.env.MAX_INPUT_PIXELS, 10) || 50_000_000; // 50 MP hard cap
+const WEBP_QUALITY = parseInt(process.env.WEBP_QUALITY, 10) || 82;                 // fix #3
 const CONCURRENCY_LIMIT = parseInt(process.env.CONCURRENCY_LIMIT, 10) || 2;
 const STORAGE_PATH = process.env.STORAGE_PATH || '/var/pratima';
 const SCHEDULED_DELETION_PATH = path.join(STORAGE_PATH, 'scheduled-deletion');
@@ -100,13 +115,24 @@ async function withCompaniesLock(fn) {
   finally { resolveLock(); }
 }
 
+// fix #5 — in-memory cache. Reads hit the file only on the first call after a
+// write; the previous version re-read + re-parsed companies.json on every
+// /img request, which is thousands of syscalls/min on a busy CDN endpoint.
+let companiesCache = null;
+
 async function loadCompanies() {
-  try { return JSON.parse(await fs.readFile(COMPANIES_FILE, 'utf-8')); }
-  catch { return []; }
+  if (companiesCache !== null) return companiesCache;
+  try {
+    companiesCache = JSON.parse(await fs.readFile(COMPANIES_FILE, 'utf-8'));
+  } catch {
+    companiesCache = [];
+  }
+  return companiesCache;
 }
 
 async function saveCompanies(list) {
   await fs.writeFile(COMPANIES_FILE, JSON.stringify(list, null, 2), 'utf-8');
+  companiesCache = list;
 }
 
 // ------------------- ClamAV -------------------
@@ -118,6 +144,27 @@ try {
   console.log('ClamAV daemon connected');
 } catch (err) {
   console.warn('ClamAV unavailable — uploads proceed without malware scanning:', err.message);
+}
+
+// fix #7 — malware scan wrapper. Distinguishes a real detection (always rejects)
+// from a scanning infrastructure failure (honours CLAMAV_FAIL_OPEN).
+async function scanForMalware(buf) {
+  if (!clamscan) return; // daemon never came up — startup already logged this
+  try {
+    const { isInfected, viruses } = await clamscan.scanStream(Readable.from(buf));
+    if (isInfected) throw new Error(`Malware detected: ${viruses.join(', ')}`);
+  } catch (err) {
+    // Re-throw actual detections untouched
+    if (err.message && err.message.startsWith('Malware detected:')) throw err;
+
+    if (CLAMAV_FAIL_OPEN) {
+      console.warn(`ClamAV scan failed (fail-open, upload allowed): ${err.message}`);
+      return;
+    }
+    const e = new Error('Malware scan unavailable — upload rejected');
+    e.statusCode = 503;
+    throw e;
+  }
 }
 
 // ------------------- Ghostscript (optional PDF compression) -------------------
@@ -142,7 +189,6 @@ async function compressPdf(buf) {
       '-dNOPAUSE', '-dQUIET', '-dBATCH', `-sOutputFile=${outPath}`, inPath,
     ], { timeout: 60_000 });
     const compressed = await fs.readFile(outPath);
-    // Only keep the compressed version if Ghostscript actually shrank it
     return compressed.length > 0 && compressed.length < buf.length ? compressed : buf;
   } catch (err) {
     console.warn('Ghostscript compression failed — storing original PDF:', err.message);
@@ -167,7 +213,6 @@ const redisSub = makeRedis(REDIS_URL);
 let redisReady = false;
 redis.on('ready', () => { redisReady = true; console.log('Redis connected'); });
 redis.on('close', () => { redisReady = false; console.warn('Redis connection closed — reconnecting…'); });
-// Log errors but do NOT exit — ioredis will reconnect automatically
 redis.on('error', err => console.error('Redis error:', err.message));
 redisSub.on('error', err => console.error('RedisSub error:', err.message));
 
@@ -176,12 +221,10 @@ const NOTIFY_CHANNEL = 'semaphore:notify';
 const ACTIVE_KEY = 'semaphore:active';
 const WAIT_KEY = 'semaphore:wait';
 
-// Reset stale counter from any previous unclean shutdown
 await redis.set(ACTIVE_KEY, 0);
 await redis.del(WAIT_KEY);
 
-// ------------------- Startup migration -------------------
-// Backfill apiKey for any companies created before per-company keys were introduced
+// Startup migration
 await withCompaniesLock(async () => {
   const list = await loadCompanies();
   const changed = list.filter(co => !co.apiKey);
@@ -214,7 +257,6 @@ redis.defineCommand('releaseSemaphore', {
   `,
 });
 
-// FIX: one persistent subscription + local Map resolvers — no per-request subscribe/unsubscribe
 const pendingWaiters = new Map();
 await redisSub.subscribe(NOTIFY_CHANNEL);
 redisSub.on('message', (channel, message) => {
@@ -223,17 +265,45 @@ redisSub.on('message', (channel, message) => {
   if (resolve) { pendingWaiters.delete(message); resolve(); }
 });
 
+// fix #2 — timeout now rejects the request AND leaves the semaphore intact.
+// The old code resolved silently and then DECR'd a slot it never held, letting
+// effectively CONCURRENCY_LIMIT+N uploads run in parallel. The LREM result
+// disambiguates the race where a slot was granted at the same instant the
+// timeout fired: LREM===0 means the releaseSemaphore LPOP already took us out
+// of the queue, so we *do* hold a slot and must resolve instead of reject.
 async function acquireSlot() {
   const id = uuidv4();
   const result = await redis.acquireSemaphore(ACTIVE_KEY, WAIT_KEY, CONCURRENCY_LIMIT, id);
   if (result === 'ACQUIRED') return;
 
-  return new Promise(resolve => {
-    const tid = setTimeout(() => {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const tid = setTimeout(async () => {
+      if (settled) return;
+      settled = true;
       pendingWaiters.delete(id);
-      resolve();
+      try {
+        const removed = await redis.lrem(WAIT_KEY, 0, id);
+        if (removed === 0) {
+          // Someone (releaseSemaphore's LPOP) already took us off the queue —
+          // that means a slot was handed to us and we must accept it.
+          resolve();
+          return;
+        }
+      } catch (err) {
+        console.warn('Semaphore LREM failed during timeout:', err.message);
+      }
+      const e = new Error('Upload queue timeout — server busy, please retry');
+      e.code = 'SEMAPHORE_TIMEOUT';
+      reject(e);
     }, 30_000);
-    pendingWaiters.set(id, () => { clearTimeout(tid); resolve(); });
+
+    pendingWaiters.set(id, () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(tid);
+      resolve();
+    });
   });
 }
 
@@ -264,7 +334,7 @@ function decryptBuffer(buf) {
 
 // ------------------- Per-company key helper -------------------
 function generateCompanyKey() {
-  return 'prtm_' + crypto.randomBytes(24).toString('hex'); // 53-char unguessable key
+  return 'prtm_' + crypto.randomBytes(24).toString('hex');
 }
 
 // ------------------- Scheduled Deletion Helpers -------------------
@@ -272,60 +342,66 @@ async function moveToScheduledDeletion(companyId, companyName, itemType, itemId 
   const timestamp = Date.now();
   const deletionId = uuidv4();
   const deletionFolder = path.join(SCHEDULED_DELETION_PATH, deletionId);
-  
+
   await fs.mkdir(deletionFolder, { recursive: true });
-  
-  // Save deletion metadata
+
   const metadata = {
     deletionId,
     companyId,
     companyName,
-    itemType, // 'company' or 'image'
+    itemType,
     imageId: itemId,
     deletedAt: new Date(timestamp).toISOString(),
     scheduledPermanentDeletionAt: new Date(timestamp + (DELETION_RETENTION_DAYS * 24 * 60 * 60 * 1000)).toISOString(),
     timestamp
   };
-  
+
   await fs.writeFile(
     path.join(deletionFolder, 'metadata.json'),
     JSON.stringify(metadata, null, 2),
     'utf-8'
   );
-  
-  // Move the actual files
+
+  // Cross-device safe move (EXDEV fallback) — cheap insurance if SCHEDULED_DELETION_PATH
+  // ever lands on a different mount than STORAGE_PATH.
+  async function renameWithFallback(src, dst) {
+    try {
+      await fs.rename(src, dst);
+    } catch (err) {
+      if (err.code !== 'EXDEV') throw err;
+      await fs.cp(src, dst, { recursive: true });
+      await fs.rm(src, { recursive: true, force: true });
+    }
+  }
+
   if (itemType === 'company') {
-    // Move entire company folder
     const sourceDir = path.join(STORAGE_PATH, 'companies', companyId);
     const targetDir = path.join(deletionFolder, 'files');
     try {
-      await fs.rename(sourceDir, targetDir);
+      await renameWithFallback(sourceDir, targetDir);
       console.log(`Moved company ${companyName} (${companyId}) to scheduled deletion (${deletionId})`);
     } catch (err) {
       if (err.code !== 'ENOENT') throw err;
-      // Company folder doesn't exist (no files uploaded yet)
       console.log(`Company ${companyName} (${companyId}) had no files - metadata saved to scheduled deletion`);
     }
   } else if (itemType === 'image') {
-    // Move individual image file and its metadata
     const companyDir = path.join(STORAGE_PATH, 'companies', companyId);
     const targetDir = path.join(deletionFolder, 'files');
     await fs.mkdir(targetDir, { recursive: true });
-    
+
     const imageFile = path.join(companyDir, itemId);
     const targetImageFile = path.join(targetDir, itemId);
-    await fs.rename(imageFile, targetImageFile);
-    
-    // Move JSON metadata if exists
+    await renameWithFallback(imageFile, targetImageFile);
+
     if (UUID_ASSET_ID_RE.test(itemId)) {
       const metaFile = path.join(companyDir, `${itemId}.json`);
       const targetMetaFile = path.join(targetDir, `${itemId}.json`);
-      await fs.rename(metaFile, targetMetaFile).catch(() => {});
+      try { await renameWithFallback(metaFile, targetMetaFile); } catch (_) {}
     }
-    
+
     console.log(`Moved image ${itemId} from company ${companyName} to scheduled deletion (${deletionId})`);
   }
-  
+
   return deletionId;
 }
 
@@ -333,23 +409,22 @@ async function cleanupExpiredDeletions() {
   try {
     const now = Date.now();
     const entries = await fs.readdir(SCHEDULED_DELETION_PATH);
-    
+
     let deletedCount = 0;
     let totalSize = 0;
-    
+
     for (const entry of entries) {
       const deletionFolder = path.join(SCHEDULED_DELETION_PATH, entry);
       const metadataFile = path.join(deletionFolder, 'metadata.json');
-      
+
       try {
         const stat = await fs.stat(deletionFolder);
         if (!stat.isDirectory()) continue;
-        
+
         const metadata = JSON.parse(await fs.readFile(metadataFile, 'utf-8'));
         const expiryTime = metadata.timestamp + (DELETION_RETENTION_DAYS * 24 * 60 * 60 * 1000);
-        
+
         if (now >= expiryTime) {
-          // Calculate size before deletion
           const filesDir = path.join(deletionFolder, 'files');
           try {
             const files = await fs.readdir(filesDir);
@@ -358,11 +433,10 @@ async function cleanupExpiredDeletions() {
               totalSize += fileStat.size;
             }
           } catch (err) { /* files dir might not exist */ }
-          
-          // Permanently delete
+
           await fs.rm(deletionFolder, { recursive: true, force: true });
           deletedCount++;
-          
+
           console.log(
             `Permanently deleted ${metadata.itemType} ` +
             `(${metadata.itemType === 'company' ? metadata.companyName : metadata.imageId}) ` +
@@ -373,7 +447,7 @@ async function cleanupExpiredDeletions() {
         console.warn(`Failed to process scheduled deletion ${entry}:`, err.message);
       }
     }
-    
+
     if (deletedCount > 0) {
       console.log(
         `Cleanup complete: permanently deleted ${deletedCount} item(s), ` +
@@ -385,16 +459,11 @@ async function cleanupExpiredDeletions() {
   }
 }
 
-// Run cleanup on startup
 await cleanupExpiredDeletions();
-
-// Schedule periodic cleanup (runs every 6 hours)
 setInterval(cleanupExpiredDeletions, 6 * 60 * 60 * 1000);
 
 // ------------------- Validation helpers -------------------
-// FIX: strict regex prevents path-traversal in image_id
 const COMPANY_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-// Legacy keys (company+filename derived) stay resolvable; new uploads use a UUID storage key.
 const LEGACY_IMAGE_ID_RE = /^pratima_[a-z0-9_]+$/;
 const UUID_ASSET_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.(webp|pdf)$/i;
 const IMAGE_ID_RE = new RegExp(`(?:${LEGACY_IMAGE_ID_RE.source})|(?:${UUID_ASSET_ID_RE.source})`, 'i');
@@ -405,22 +474,19 @@ function isAssetFile(filename) {
 
 // ------------------- Express setup -------------------
 const app = express();
-app.set('trust proxy', 1); // honour X-Forwarded-For behind nginx
+app.set('trust proxy', 1);
 
-// CORS — must come before every other middleware so preflight OPTIONS requests
-// are answered before rate-limiting or auth runs
 app.use((req, res, next) => {
   res.set('Access-Control-Allow-Origin', '*');
   res.set('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
   res.set('Access-Control-Allow-Headers', 'x-api-key, Content-Type');
-  res.set('Access-Control-Max-Age', '86400'); // cache preflight for 24 h
+  res.set('Access-Control-Max-Age', '86400');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
 
 app.use(express.json({ limit: '16kb' }));
 
-// Global rate limit (generous baseline; specific routes tighten further)
 app.use(rateLimit({
   windowMs: 60_000, max: 300,
   standardHeaders: true, legacyHeaders: false,
@@ -440,17 +506,12 @@ const mgmtLimiter = rateLimit({
 });
 
 // ------------------- Authentication Middleware -------------------
-
-// IP Whitelist middleware
 const ipWhitelist = (req, res, next) => {
   if (ALLOWED_IPS.length === 0) return next();
   const clientIP = req.ip;
-  // Check exact IP matches
   if (ALLOWED_IPS.includes(clientIP)) return next();
-  // Check CIDR ranges if needed (basic implementation)
   for (const allowedIP of ALLOWED_IPS) {
     if (allowedIP.includes('/')) {
-      // Simple CIDR check for /24, /16, /8
       const [range, bits] = allowedIP.split('/');
       const rangeParts = range.split('.');
       const ipParts = clientIP.replace('::ffff:', '').split('.');
@@ -459,10 +520,7 @@ const ipWhitelist = (req, res, next) => {
         const significantOctets = Math.floor(parseInt(bits) / 8);
         const remainingBits = parseInt(bits) % 8;
         for (let i = 0; i < significantOctets; i++) {
-          if (ipParts[i] !== rangeParts[i]) {
-            match = false;
-            break;
-          }
+          if (ipParts[i] !== rangeParts[i]) { match = false; break; }
         }
         if (match && remainingBits > 0) {
           const mask = 256 - Math.pow(2, 8 - remainingBits);
@@ -477,7 +535,6 @@ const ipWhitelist = (req, res, next) => {
   return res.status(403).json({ error: 'Access denied from this IP address' });
 };
 
-// Basic API-key guard — localhost (server shell / health checks) bypasses
 const verifyApiKey = (req, res, next) => {
   const ip = req.ip;
   if (ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1') return next();
@@ -485,19 +542,13 @@ const verifyApiKey = (req, res, next) => {
   next();
 };
 
-// UI-specific API-key guard with HTML login form for /ui route
 const verifyApiKeyWithRedirect = (req, res, next) => {
   const ip = req.ip;
-  
-  // Allow localhost without auth
   if (ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1') return next();
-  
-  // Check for API key in header or query parameter
+
   const apiKey = req.headers['x-api-key'] || req.query.key;
-  
   if (apiKey === API_KEY) return next();
-  
-  // For HTML pages, show a login form instead of JSON error
+
   if ((req.path === '/ui' || req.path === '/ui/') && req.accepts('html')) {
     return res.status(401).send(`
       <!DOCTYPE html>
@@ -506,9 +557,9 @@ const verifyApiKeyWithRedirect = (req, res, next) => {
         <title>Authentication Required - Pratima</title>
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <style>
-          body { 
+          body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-            background: #080b0e; color: #e8edf2; display: flex; 
+            background: #080b0e; color: #e8edf2; display: flex;
             align-items: center; justify-content: center; min-height: 100vh;
             margin: 0; line-height: 1.5;
           }
@@ -529,7 +580,7 @@ const verifyApiKeyWithRedirect = (req, res, next) => {
           }
           .logo-text { background: linear-gradient(135deg, #10b981, #3b82f6); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
           .subtitle { color: #5a6875; font-size: 13px; margin-bottom: 24px; }
-          input { 
+          input {
             width: 100%; padding: 10px 12px; background: #141c24; border: 1px solid #253040;
             border-radius: 8px; color: #e8edf2; font-size: 14px; outline: none;
             box-sizing: border-box; transition: border-color 0.15s;
@@ -542,8 +593,8 @@ const verifyApiKeyWithRedirect = (req, res, next) => {
           }
           button:hover { background: #0ea774; }
           button:disabled { opacity: 0.6; cursor: not-allowed; }
-          .error { 
-            color: #ef4444; font-size: 12px; margin-top: 8px; display: none; 
+          .error {
+            color: #ef4444; font-size: 12px; margin-top: 8px; display: none;
             padding: 8px; background: rgba(239,68,68,0.1); border-radius: 6px;
           }
           .hint { color: #5a6875; font-size: 11px; margin-top: 16px; text-align: center; }
@@ -574,7 +625,6 @@ const verifyApiKeyWithRedirect = (req, res, next) => {
           </div>
         </div>
         <script>
-
         if (location.search.includes('key=')) {
           history.replaceState({}, '', location.pathname);
         }
@@ -583,19 +633,19 @@ const verifyApiKeyWithRedirect = (req, res, next) => {
             const key = document.getElementById('key').value.trim();
             const btn = document.getElementById('submit-btn');
             const error = document.getElementById('error');
-            
+
             if (!key) {
               error.textContent = 'Please enter an API key';
               error.style.display = 'block';
               return;
             }
-            
+
             btn.disabled = true;
             btn.innerHTML = '<span class="spinner"></span>Authenticating...';
             error.style.display = 'none';
-            
+
             try {
-              const res = await fetch('/ui/api/stats', { 
+              const res = await fetch('/ui/api/stats', {
                 headers: { 'x-api-key': key },
                 signal: AbortSignal.timeout(5000)
               });
@@ -620,11 +670,10 @@ const verifyApiKeyWithRedirect = (req, res, next) => {
       </html>
     `);
   }
-  
-  // For API calls, check query parameter key as well
+
   const queryKey = req.query.key;
   if (queryKey === API_KEY) return next();
-  
+
   return res.status(403).json({ error: 'Forbidden - valid API key required' });
 };
 
@@ -634,7 +683,6 @@ app.get('/health', PROTECT_HEALTH ? verifyApiKey : (_req, res, next) => next(), 
 );
 
 // ------------------- Company Management -------------------
-// FIX: GET /companies now requires auth — was fully open to anonymous callers
 app.get('/companies', verifyApiKey, async (_req, res) => {
   res.json(await loadCompanies());
 });
@@ -658,7 +706,6 @@ app.delete('/companies/:id', verifyApiKey, mgmtLimiter, async (req, res) => {
   const { id } = req.params;
   if (!COMPANY_UUID_RE.test(id)) return res.status(400).json({ error: 'Invalid company ID' });
 
-  // FIX: collect result inside lock, send response outside — no response-inside-mutex
   let removed = null;
   const found = await withCompaniesLock(async () => {
     const list = await loadCompanies();
@@ -671,19 +718,17 @@ app.delete('/companies/:id', verifyApiKey, mgmtLimiter, async (req, res) => {
 
   if (!found) return res.status(404).json({ error: 'Company not found' });
 
-  // Move to scheduled deletion instead of permanent delete
   try {
     const deletionId = await moveToScheduledDeletion(removed.id, removed.name, 'company');
     console.log(`Company deleted (soft): ${removed.name} (${removed.id}) - deletion ID: ${deletionId}`);
-    res.json({ 
-      success: true, 
+    res.json({
+      success: true,
       deletionId,
       message: `Company moved to scheduled deletion. Will be permanently deleted after ${DELETION_RETENTION_DAYS} days.`
     });
   } catch (e) {
     console.error(`Failed to move company ${removed.id} to scheduled deletion:`, e.message);
-    // Fallback: if scheduled deletion fails, we've already removed from companies.json
-    res.json({ 
+    res.json({
       success: true,
       warning: 'Company removed from system but scheduled deletion failed'
     });
@@ -691,9 +736,6 @@ app.delete('/companies/:id', verifyApiKey, mgmtLimiter, async (req, res) => {
 });
 
 // ------------------- Company Domain Restriction -------------------
-// Optional per-company allow-list of hostnames permitted to fetch that company's files via
-// GET /img. Absent or empty = unrestricted (the default, and the only state any pre-existing
-// company will ever have unless someone explicitly opts in from the UI).
 app.put('/companies/:id/domains', verifyApiKey, mgmtLimiter, async (req, res) => {
   const { id } = req.params;
   if (!COMPANY_UUID_RE.test(id)) return res.status(400).json({ error: 'Invalid company ID' });
@@ -721,9 +763,10 @@ app.put('/companies/:id/domains', verifyApiKey, mgmtLimiter, async (req, res) =>
 });
 
 // ------------------- Company Backup / Restore -------------------
-// Single-company ZIP snapshot of every stored file + metadata sidecar. Restore never touches
-// company.json (name/apiKey/allowedDomains stay whatever is live) — it only replaces file bytes,
-// so a stale backup can never resurrect a rotated/leaked API key.
+// fix #6 — streaming backup. Previously AdmZip assembled the whole archive in RAM
+// (zip.toBuffer()) before sending; a company with 5,000 files could easily push
+// 500 MB+ into the heap. archiver streams straight to the response socket, so
+// peak memory is O(chunk size), independent of the archive total.
 app.get('/companies/:id/backup', verifyApiKey, mgmtLimiter, async (req, res) => {
   const { id } = req.params;
   if (!COMPANY_UUID_RE.test(id)) return res.status(400).json({ error: 'Invalid company ID' });
@@ -733,64 +776,130 @@ app.get('/companies/:id/backup', verifyApiKey, mgmtLimiter, async (req, res) => 
   if (!company) return res.status(404).json({ error: 'Company not found' });
 
   const dir = path.join(STORAGE_PATH, 'companies', id);
-  const zip = new AdmZip();
-  zip.addFile('company.json', Buffer.from(JSON.stringify(company, null, 2)));
+  const safeName = company.name.replace(/[^a-z0-9_-]+/gi, '_');
+
+  res.set('Content-Type', 'application/zip');
+  res.set('Content-Disposition', `attachment; filename="pratima-backup-${safeName}-${id}.zip"`);
+
+  const archive = archiver('zip', { zlib: { level: 6 } });
+  archive.on('warning', err => console.warn('Backup archive warning:', err.message));
+  archive.on('error', err => {
+    console.error('Backup archive error:', err);
+    // Headers may already be flushed — just terminate the socket
+    try { res.destroy(err); } catch (_) {}
+  });
+
+  archive.pipe(res);
+
+  archive.append(JSON.stringify(company, null, 2), { name: 'company.json' });
 
   let fileCount = 0;
   try {
     const files = await fs.readdir(dir);
     for (const f of files) {
-      zip.addFile(`files/${f}`, await fs.readFile(path.join(dir, f)));
+      const assetName = f.endsWith('.json') ? f.slice(0, -5) : f;
+      if (!isAssetFile(assetName)) continue;
+      archive.file(path.join(dir, f), { name: `files/${f}` });
       fileCount++;
     }
-  } catch (_) { /* company has no files yet — backup is still valid with just company.json */ }
+  } catch (_) { /* company has no files yet */ }
 
-  const safeName = company.name.replace(/[^a-z0-9_-]+/gi, '_');
-  res.set('Content-Type', 'application/zip');
-  res.set('Content-Disposition', `attachment; filename="pratima-backup-${safeName}-${id}.zip"`);
-  res.send(zip.toBuffer());
-  console.log(`Backup created for ${company.name} (${id}) — ${fileCount} file(s)`);
+  archive.on('end', () => {
+    console.log(`Backup streamed for ${company.name} (${id}) — ${fileCount} file(s)`);
+  });
+
+  await archive.finalize();
 });
 
+// Restore: accept the ZIP on disk instead of buffering in RAM.
 const restoreUpload = multer({
-  storage: multer.memoryStorage(),
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => cb(null, os.tmpdir()),
+    filename: (_req, _file, cb) => cb(null, `pratima-restore-${uuidv4()}.zip`),
+  }),
   limits: { fileSize: MAX_BACKUP_SIZE },
 });
 
+// fix #6 — streaming restore. Previously AdmZip loaded the whole archive into
+// memory and getData() synchronously produced a Buffer per entry, blocking the
+// event loop for the duration. yauzl reads lazily and pipes each entry to disk.
 app.post('/companies/:id/restore', verifyApiKey, mgmtLimiter, restoreUpload.single('backup'), async (req, res) => {
   const { id } = req.params;
   if (!COMPANY_UUID_RE.test(id)) return res.status(400).json({ error: 'Invalid company ID' });
   if (!req.file) return res.status(400).json({ error: 'No backup ZIP provided (field name: backup)' });
 
-  const companies = await loadCompanies();
-  const company = companies.find(c => c.id === id);
-  if (!company) return res.status(404).json({ error: 'Company not found — create it first, then restore its files into it' });
+  const zipPath = req.file.path;
+  let companyDir = null;
+  let company = null;
 
-  let zip;
-  try { zip = new AdmZip(req.file.buffer); }
-  catch { return res.status(400).json({ error: 'Invalid ZIP file' }); }
+  try {
+    const companies = await loadCompanies();
+    company = companies.find(c => c.id === id);
+    if (!company) {
+      return res.status(404).json({ error: 'Company not found — create it first, then restore its files into it' });
+    }
 
-  const companyDir = path.join(STORAGE_PATH, 'companies', id);
-  await fs.mkdir(companyDir, { recursive: true });
+    companyDir = path.join(STORAGE_PATH, 'companies', id);
+    await fs.mkdir(companyDir, { recursive: true });
 
-  let restored = 0, skipped = 0;
-  for (const entry of zip.getEntries()) {
-    if (entry.isDirectory || !entry.entryName.startsWith('files/')) continue;
+    let restored = 0, skipped = 0;
 
-    const basename = entry.entryName.slice('files/'.length);
-    // Only a flat filename is ever accepted — rejects nested paths / zip-slip traversal.
-    if (!basename || basename.includes('/') || basename.includes('\\')) { skipped++; continue; }
+    await new Promise((resolve, reject) => {
+      yauzl.open(zipPath, { lazyEntries: true, autoClose: true }, (err, zipfile) => {
+        if (err) return reject(err);
 
-    const assetName = basename.endsWith('.json') ? basename.slice(0, -5) : basename;
-    if (!isAssetFile(assetName)) { skipped++; continue; }
+        zipfile.on('error', reject);
+        zipfile.on('end', resolve);
 
-    await fs.writeFile(path.join(companyDir, basename), entry.getData(), { mode: 0o600 });
-    restored++;
+        zipfile.readEntry();
+
+        zipfile.on('entry', (entry) => {
+          // Directories, non-files/ entries — skip
+          if (/\/$/.test(entry.fileName) || !entry.fileName.startsWith('files/')) {
+            return zipfile.readEntry();
+          }
+
+          const basename = entry.fileName.slice('files/'.length);
+          // Flat filename only — rejects nested paths and zip-slip traversal
+          if (!basename || basename.includes('/') || basename.includes('\\')) {
+            skipped++;
+            return zipfile.readEntry();
+          }
+
+          const assetName = basename.endsWith('.json') ? basename.slice(0, -5) : basename;
+          if (!isAssetFile(assetName)) {
+            skipped++;
+            return zipfile.readEntry();
+          }
+
+          zipfile.openReadStream(entry, (streamErr, readStream) => {
+            if (streamErr) {
+              skipped++;
+              return zipfile.readEntry();
+            }
+            const target = path.join(companyDir, basename);
+            const writeStream = createWriteStream(target, { mode: 0o600 });
+            streamPipeline(readStream, writeStream)
+              .then(() => { restored++; })
+              .catch(e => {
+                console.warn(`Failed to restore ${basename}:`, e.message);
+                skipped++;
+              })
+              .finally(() => zipfile.readEntry());
+          });
+        });
+      });
+    });
+
+    console.log(`Restored ${restored} file(s) for ${company.name} (${id}) from backup` +
+      (skipped ? `, skipped ${skipped} invalid entr${skipped === 1 ? 'y' : 'ies'}` : ''));
+    res.json({ success: true, restored, skipped });
+  } catch (err) {
+    console.error('Restore failed:', err.message);
+    if (!res.headersSent) res.status(400).json({ error: 'Invalid or corrupted ZIP file' });
+  } finally {
+    await fs.unlink(zipPath).catch(() => {});
   }
-
-  console.log(`Restored ${restored} file(s) for ${company.name} (${id}) from backup` +
-    (skipped ? `, skipped ${skipped} invalid entr${skipped === 1 ? 'y' : 'ies'}` : ''));
-  res.json({ success: true, restored, skipped });
 });
 
 // ------------------- Image / PDF Upload -------------------
@@ -814,50 +923,65 @@ app.post('/upload', uploadLimiter, upload.single('image'), async (req, res) => {
   const company = companies.find(c => c.id === companyId);
   if (!company) return res.status(404).json({ error: 'Company not found' });
 
-  // Each company authenticates with its own key — not the global admin key
   if (req.headers['x-api-key'] !== company.apiKey) {
     return res.status(403).json({ error: 'Invalid API key for this company' });
   }
 
-  await acquireSlot();
+  // fix #2 — semaphore failure must reject before we touch the slot counter
+  try {
+    await acquireSlot();
+  } catch (err) {
+    if (err.code === 'SEMAPHORE_TIMEOUT') {
+      return res.status(503).json({ error: err.message, retryAfter: 5 });
+    }
+    throw err;
+  }
+
   try {
     const buf = req.file.buffer;
     const isPdf = req.file.mimetype === 'application/pdf';
 
-    // Malware scan runs on the raw upload regardless of file type.
-    if (clamscan) {
-      const { isInfected, viruses } = await clamscan.scanStream(Readable.from(buf));
-      if (isInfected) throw new Error(`Malware detected: ${viruses.join(', ')}`);
-    }
+    // fix #7 — scan wrapper
+    await scanForMalware(buf);
 
     let processedBuf, ext, contentType;
     if (isPdf) {
       ext = 'pdf';
       contentType = 'application/pdf';
-      processedBuf = await compressPdf(buf); // no-op passthrough if Ghostscript isn't installed
+      processedBuf = await compressPdf(buf);
     } else {
-      const meta = await sharp(buf).metadata();
-      if (!meta.format) throw new Error('Unrecognised image format');
-      // FIX: removed .withMetadata(false) — sharp strips metadata by default without this call.
-      // Calling .withMetadata(false) passes a falsy options object which may re-enable metadata.
+      // fix #1 — single sharp instance for both metadata and encoding,
+      // EXIF auto-rotation, no fail-fast on truncated inputs, and a hard pixel cap.
+      let pipeline;
+      try {
+        pipeline = sharp(buf, {
+          failOn: 'none',
+          limitInputPixels: MAX_INPUT_PIXELS,
+        }).rotate(); // applies EXIF orientation, then discards the tag
+        const meta = await pipeline.metadata();
+        if (!meta.format) throw new Error('Unrecognised image format');
+      } catch (err) {
+        throw new Error('Invalid or unsupported image: ' + err.message);
+      }
       ext = 'webp';
       contentType = 'image/webp';
-      processedBuf = await sharp(buf).webp({ quality: WEBP_QUALITY }).toBuffer();
+      processedBuf = await pipeline.webp({
+        quality: WEBP_QUALITY,
+        effort: 4,
+        smartSubsample: true,
+      }).toBuffer();
     }
     const encrypted = encryptBuffer(processedBuf);
 
     const companyDir = path.join(STORAGE_PATH, 'companies', companyId);
     await fs.mkdir(companyDir, { recursive: true });
 
-    // Storage key is a server-generated UUID — never derived from the client filename,
-    // so two uploads can never collide on path even with identical original names.
     let imageId, targetPath;
     const MAX_ID_ATTEMPTS = 5;
     for (let attempt = 1; ; attempt++) {
       imageId = `${uuidv4()}.${ext}`;
       targetPath = path.join(companyDir, imageId);
       try {
-        // 'wx' fails loudly (EEXIST) instead of silently overwriting on a collision.
         await fs.writeFile(targetPath, encrypted, { flag: 'wx', mode: 0o600 });
         break;
       } catch (err) {
@@ -867,8 +991,6 @@ app.post('/upload', uploadLimiter, upload.single('image'), async (req, res) => {
       }
     }
 
-    // Original filename is kept only as metadata (e.g. Content-Disposition on download),
-    // never as part of the storage key/path.
     const metaPath = path.join(companyDir, `${imageId}.json`);
     await fs.writeFile(metaPath, JSON.stringify({
       originalName: req.file.originalname,
@@ -881,7 +1003,8 @@ app.post('/upload', uploadLimiter, upload.single('image'), async (req, res) => {
     res.json({ url: `${PUBLIC_URL}/img/${companyId}/${imageId}`, imageId, companyId, type: isPdf ? 'pdf' : 'image' });
   } catch (err) {
     console.error('Upload error:', err.message);
-    res.status(400).json({ error: err.message });
+    const status = err.statusCode || 400;
+    res.status(status).json({ error: err.message });
   } finally {
     await releaseSlot();
   }
@@ -891,12 +1014,10 @@ app.post('/upload', uploadLimiter, upload.single('image'), async (req, res) => {
 app.get('/img/:company_id/:image_id', async (req, res) => {
   const { company_id, image_id } = req.params;
 
-  // FIX: strict regex on image_id prevents path-traversal attacks
   if (!COMPANY_UUID_RE.test(company_id)) return res.status(400).send('Invalid company ID');
   if (!IMAGE_ID_RE.test(image_id)) return res.status(400).send('Invalid image ID');
 
   try {
-    // Optional per-company domain allow-list. Absent/empty = unrestricted (unchanged default behavior).
     const companies = await loadCompanies();
     const company = companies.find(c => c.id === company_id);
     if (!company) return res.status(404).send('Not found');
@@ -917,16 +1038,15 @@ app.get('/img/:company_id/:image_id', async (req, res) => {
     const isPdf = image_id.toLowerCase().endsWith('.pdf');
     res.set('Content-Type', isPdf ? 'application/pdf' : 'image/webp');
     res.set('Cache-Control', 'public, max-age=31536000, immutable');
-    res.set('Access-Control-Allow-Origin', '*'); // allow <img>/<embed> tags from other domains
+    res.set('Access-Control-Allow-Origin', '*');
 
-    // Original filename (if we have it) surfaces only in Content-Disposition, never in the path.
     if (UUID_ASSET_ID_RE.test(image_id)) {
       try {
         const sidecar = JSON.parse(await fs.readFile(path.join(companyDir, `${image_id}.json`), 'utf-8'));
         if (sidecar.originalName) {
           res.set('Content-Disposition', `inline; filename="${encodeURIComponent(sidecar.originalName)}"`);
         }
-      } catch { /* no metadata sidecar — serve without Content-Disposition */ }
+      } catch { /* no metadata sidecar */ }
     }
 
     res.send(decrypted);
@@ -946,23 +1066,19 @@ app.delete('/img/:company_id/:image_id', async (req, res) => {
   const company = companies.find(c => c.id === company_id);
   if (!company) return res.status(404).json({ error: 'Company not found' });
 
-  // Each company uses its own API key (the prtm_... key)
   if (req.headers['x-api-key'] !== company.apiKey) {
     return res.status(403).json({ error: 'Invalid API key' });
   }
 
   const companyDir = path.join(STORAGE_PATH, 'companies', company_id);
   const filePath = path.join(companyDir, image_id);
-  
+
   try {
-    // Check if file exists
     await fs.access(filePath);
-    
-    // Move to scheduled deletion instead of permanent delete
     const deletionId = await moveToScheduledDeletion(company_id, company.name, 'image', image_id);
-    
+
     console.log(`Image deleted (soft): ${image_id} for ${company.name} (${company_id}) - deletion ID: ${deletionId}`);
-    return res.json({ 
+    return res.json({
       success: true,
       deletionId,
       message: `Image moved to scheduled deletion. Will be permanently deleted after ${DELETION_RETENTION_DAYS} days.`
@@ -975,27 +1091,24 @@ app.delete('/img/:company_id/:image_id', async (req, res) => {
 });
 
 // ------------------- Scheduled Deletion Management -------------------
-// List all items in scheduled deletion
 app.get('/scheduled-deletions', verifyApiKey, async (_req, res) => {
   try {
     const entries = await fs.readdir(SCHEDULED_DELETION_PATH);
     const deletions = [];
-    
+
     for (const entry of entries) {
       const deletionFolder = path.join(SCHEDULED_DELETION_PATH, entry);
       const metadataFile = path.join(deletionFolder, 'metadata.json');
-      
+
       try {
         const stat = await fs.stat(deletionFolder);
         if (!stat.isDirectory()) continue;
-        
+
         const metadata = JSON.parse(await fs.readFile(metadataFile, 'utf-8'));
-        
-        // Calculate days remaining
         const now = Date.now();
         const expiryTime = metadata.timestamp + (DELETION_RETENTION_DAYS * 24 * 60 * 60 * 1000);
         const daysRemaining = Math.ceil((expiryTime - now) / (24 * 60 * 60 * 1000));
-        
+
         deletions.push({
           ...metadata,
           daysRemaining,
@@ -1005,10 +1118,8 @@ app.get('/scheduled-deletions', verifyApiKey, async (_req, res) => {
         console.warn(`Failed to read scheduled deletion ${entry}:`, err.message);
       }
     }
-    
-    // Sort by deletion date (most recent first)
+
     deletions.sort((a, b) => b.timestamp - a.timestamp);
-    
     res.json({ deletions, retentionDays: DELETION_RETENTION_DAYS });
   } catch (err) {
     console.error('Failed to list scheduled deletions:', err);
@@ -1016,42 +1127,45 @@ app.get('/scheduled-deletions', verifyApiKey, async (_req, res) => {
   }
 });
 
-// Restore a company or image from scheduled deletion
 app.post('/scheduled-deletions/:deletionId/restore', verifyApiKey, mgmtLimiter, async (req, res) => {
   const { deletionId } = req.params;
-  
   const deletionFolder = path.join(SCHEDULED_DELETION_PATH, deletionId);
   const metadataFile = path.join(deletionFolder, 'metadata.json');
-  
+
+  async function renameWithFallback(src, dst) {
+    try { await fs.rename(src, dst); }
+    catch (err) {
+      if (err.code !== 'EXDEV') throw err;
+      await fs.cp(src, dst, { recursive: true });
+      await fs.rm(src, { recursive: true, force: true });
+    }
+  }
+
   try {
     const metadata = JSON.parse(await fs.readFile(metadataFile, 'utf-8'));
-    
-    // Check if still within retention period
+
     const now = Date.now();
     const expiryTime = metadata.timestamp + (DELETION_RETENTION_DAYS * 24 * 60 * 60 * 1000);
     if (now >= expiryTime) {
       return res.status(410).json({ error: 'This item has already been permanently deleted' });
     }
-    
+
     if (metadata.itemType === 'company') {
-      // Restore company
-      // First, check if company ID still exists in companies.json
       const companies = await loadCompanies();
       const existingCompany = companies.find(c => c.id === metadata.companyId);
-      
+
       if (!existingCompany) {
-        return res.status(400).json({ 
-          error: 'Cannot restore: Company no longer exists in system. Please recreate the company first.' 
+        return res.status(400).json({
+          error: 'Cannot restore: Company no longer exists in system. Please recreate the company first.'
         });
       }
-      
-      // Move files back to company folder
+
       const sourceDir = path.join(deletionFolder, 'files');
       const targetDir = path.join(STORAGE_PATH, 'companies', metadata.companyId);
-      
+
       try {
         await fs.access(sourceDir);
-        await fs.rename(sourceDir, targetDir);
+        await renameWithFallback(sourceDir, targetDir);
         console.log(`Restored company ${metadata.companyName} (${metadata.companyId}) from scheduled deletion`);
       } catch (err) {
         if (err.code === 'ENOENT') {
@@ -1060,51 +1174,46 @@ app.post('/scheduled-deletions/:deletionId/restore', verifyApiKey, mgmtLimiter, 
           throw err;
         }
       }
-      
-      // Remove from scheduled deletion
+
       await fs.rm(deletionFolder, { recursive: true, force: true });
-      
-      res.json({ 
-        success: true, 
+
+      res.json({
+        success: true,
         message: `Company ${metadata.companyName} restored successfully`,
         itemType: 'company',
         companyId: metadata.companyId
       });
-      
+
     } else if (metadata.itemType === 'image') {
-      // Restore individual image
       const companies = await loadCompanies();
       const company = companies.find(c => c.id === metadata.companyId);
-      
+
       if (!company) {
-        return res.status(400).json({ 
-          error: 'Cannot restore: Parent company no longer exists' 
+        return res.status(400).json({
+          error: 'Cannot restore: Parent company no longer exists'
         });
       }
-      
+
       const sourceDir = path.join(deletionFolder, 'files');
       const targetDir = path.join(STORAGE_PATH, 'companies', metadata.companyId);
       await fs.mkdir(targetDir, { recursive: true });
-      
-      // Move image file back
+
       const sourceImageFile = path.join(sourceDir, metadata.imageId);
       const targetImageFile = path.join(targetDir, metadata.imageId);
-      await fs.rename(sourceImageFile, targetImageFile);
-      
-      // Move metadata file back if exists
+      await renameWithFallback(sourceImageFile, targetImageFile);
+
       if (UUID_ASSET_ID_RE.test(metadata.imageId)) {
         const sourceMetaFile = path.join(sourceDir, `${metadata.imageId}.json`);
         const targetMetaFile = path.join(targetDir, `${metadata.imageId}.json`);
-        await fs.rename(sourceMetaFile, targetMetaFile).catch(() => {});
+        try { await renameWithFallback(sourceMetaFile, targetMetaFile); } catch (_) {}
       }
-      
-      // Remove from scheduled deletion
+
       await fs.rm(deletionFolder, { recursive: true, force: true });
-      
+
       console.log(`Restored image ${metadata.imageId} from company ${metadata.companyName}`);
-      
-      res.json({ 
-        success: true, 
+
+      res.json({
+        success: true,
         message: `Image ${metadata.imageId} restored successfully`,
         itemType: 'image',
         companyId: metadata.companyId,
@@ -1121,25 +1230,21 @@ app.post('/scheduled-deletions/:deletionId/restore', verifyApiKey, mgmtLimiter, 
   }
 });
 
-// Permanently delete an item from scheduled deletion (skip retention period)
 app.delete('/scheduled-deletions/:deletionId', verifyApiKey, mgmtLimiter, async (req, res) => {
   const { deletionId } = req.params;
-  
   const deletionFolder = path.join(SCHEDULED_DELETION_PATH, deletionId);
   const metadataFile = path.join(deletionFolder, 'metadata.json');
-  
+
   try {
     const metadata = JSON.parse(await fs.readFile(metadataFile, 'utf-8'));
-    
-    // Permanently delete
     await fs.rm(deletionFolder, { recursive: true, force: true });
-    
+
     console.log(
       `Manually permanently deleted ${metadata.itemType} ` +
       `(${metadata.itemType === 'company' ? metadata.companyName : metadata.imageId})`
     );
-    
-    res.json({ 
+
+    res.json({
       success: true,
       message: `${metadata.itemType === 'company' ? 'Company' : 'Image'} permanently deleted`
     });
@@ -1157,8 +1262,6 @@ app.get('/ui', verifyApiKeyWithRedirect, ipWhitelist, async (_req, res) => {
   try {
     let html = await fs.readFile(path.join(__dirname, 'ui.html'), 'utf-8');
     const injectedKey = JSON.stringify(API_KEY);
-    // FIX: inject a script that captures ?key= from the URL into sessionStorage
-    // so uiFetch() finds the key on the very first dashboard load.
     const injectedScript = `<script>
       window.PRATIMA_GLOBAL_API_KEY = ${injectedKey};
       (function(){
@@ -1212,8 +1315,10 @@ app.get('/ui/api/stats', verifyApiKeyWithRedirect, ipWhitelist, async (_req, res
     config: {
       port: PORT,
       maxFileSize: MAX_FILE_SIZE,
+      maxInputPixels: MAX_INPUT_PIXELS,
       webpQuality: WEBP_QUALITY,
       concurrencyLimit: CONCURRENCY_LIMIT,
+      clamavFailOpen: CLAMAV_FAIL_OPEN,
       storagePath: STORAGE_PATH,
       publicUrl: PUBLIC_URL,
     },
@@ -1250,7 +1355,6 @@ app.get('/ui/api/images', verifyApiKeyWithRedirect, ipWhitelist, async (req, res
   res.json(images);
 });
 
-// SSE log stream — sends buffered history then streams live entries
 app.get('/ui/api/logs', verifyApiKeyWithRedirect, ipWhitelist, (req, res) => {
   res.set({
     'Content-Type': 'text/event-stream',
@@ -1282,6 +1386,8 @@ const server = app.listen(PORT, HOST, () => {
   console.log(`Dashboard: http://${HOST}:${PORT}/ui`);
   console.log('Authentication: Required for all UI and management endpoints');
   console.log('Security: AES-256-GCM encryption, ClamAV scanning, rate limiting, IP whitelisting available');
+  console.log(`Sharp: cache=off, concurrency=1, max input ${MAX_INPUT_PIXELS / 1_000_000} MP, WebP quality ${WEBP_QUALITY}`);
+  console.log(`ClamAV mode: ${CLAMAV_FAIL_OPEN ? 'fail-open' : 'fail-closed'}`);
 });
 
 async function shutdown(signal) {
@@ -1290,7 +1396,7 @@ async function shutdown(signal) {
     try { await redis.quit(); await redisSub.quit(); } catch (_) { }
     process.exit(0);
   });
-  setTimeout(() => process.exit(1), 10_000); // force-kill after 10 s
+  setTimeout(() => process.exit(1), 10_000);
 }
 
 process.on('SIGTERM', () => shutdown('SIGTERM'));
